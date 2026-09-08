@@ -1,0 +1,11 @@
+name = "pico2kvm"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[[durable_objects.bindings]]
+name = "DEVICE"
+class_name = "DeviceDO"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["DeviceDO"]
