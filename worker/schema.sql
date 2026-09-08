@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY CHECK(id=1), password_hash TEXT NOT NULL, totp_secret TEXT NOT NULL);

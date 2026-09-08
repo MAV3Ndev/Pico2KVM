@@ -1,48 +1,20 @@
-export interface Env {
-  DEVICE: DurableObjectNamespace;
-  PASSWORD_HASH?: string;
-  TOTP_SECRET?: string;
-  SESSION_SECRET?: string;
+export interface Env { DEVICE: DurableObjectNamespace; DB?: D1Database; SESSION_SECRET: string; }
+const json=(body:unknown,status=200,headers:Record<string,string>={})=>new Response(JSON.stringify(body),{status,headers:{"content-type":"application/json",...headers}});
+export class DeviceSession implements DurableObject {
+ private sockets=new Set<WebSocket>();
+ constructor(private state:DurableObjectState, private env:Env){}
+ async fetch(req:Request):Promise<Response>{
+  if(req.headers.get("Upgrade")?.toLowerCase()!=="websocket") return json({error:"websocket required"},426);
+  if(this.sockets.size>=2) return json({error:"device busy"},409);
+  const pair=new WebSocketPair(); const [client,server]=Object.values(pair) as [WebSocket,WebSocket]; server.accept(); this.sockets.add(server);
+  server.addEventListener("message",ev=>{const size=typeof ev.data==="string"?ev.data.length:ev.data instanceof ArrayBuffer?ev.data.byteLength:0;if(size>16384)return server.close(1009,"frame too large");for(const p of this.sockets)if(p!==server&&p.readyState===WebSocket.OPEN)p.send(ev.data as any);});
+  const clean=()=>this.sockets.delete(server); server.addEventListener("close",clean); server.addEventListener("error",clean); return new Response(null,{status:101,webSocket:client});
+ }
 }
-
-const json = (data: unknown, init: ResponseInit = {}) =>
-  new Response(JSON.stringify(data), { ...init, headers: { "content-type": "application/json", ...(init.headers || {}) } });
-
-export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
-    const url = new URL(req.url);
-    if (url.pathname === "/api/login" && req.method === "POST") return login(req, env);
-    if (url.pathname.startsWith("/device/") && req.headers.get("Upgrade") === "websocket") {
-      const id = url.pathname.split("/")[2];
-      if (!id) return new Response("missing device", { status: 400 });
-      const token = req.headers.get("Authorization")?.replace(/^Bearer\s+/, "") || getCookie(req, "session");
-      if (!token || !(await verifyToken(token, env))) return new Response("unauthorized", { status: 401 });
-      return env.DEVICE.get(env.DEVICE.idFromName(id)).fetch(req);
-    }
-    return new Response("Pico2KVM", { status: 200 });
-  },
-};
-
-async function login(req: Request, env: Env) {
-  let body: any; try { body = await req.json(); } catch { return json({ error: "invalid json" }, { status: 400 }); }
-  if (!body.password || !body.otp) return json({ error: "credentials required" }, { status: 401 });
-  // Password/TOTP verification is delegated to configured verifier in production.
-  if (env.PASSWORD_HASH && body.password !== env.PASSWORD_HASH) return json({ error: "invalid credentials" }, { status: 401 });
-  if (env.TOTP_SECRET && String(body.otp).length !== 6) return json({ error: "invalid credentials" }, { status: 401 });
-  const token = await signToken({ exp: Date.now() + 5 * 60_000 }, env.SESSION_SECRET || "dev-secret");
-  return json({ ok: true }, { headers: { "set-cookie": `session=${token}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=300` } });
-}
-
-function getCookie(req: Request, name: string) { return req.headers.get("Cookie")?.match(new RegExp(`${name}=([^;]+)`))?.[1]; }
-async function signToken(payload: any, secret: string) { const data = btoa(JSON.stringify(payload)); const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]); const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data)); return `${data}.${btoa(String.fromCharCode(...new Uint8Array(sig)))}`; }
-async function verifyToken(token: string, env: Env) { try { const [d,s] = token.split("."); if (!d || !s) return false; const p = JSON.parse(atob(d)); if (p.exp < Date.now()) return false; return token === await signToken(p, env.SESSION_SECRET || "dev-secret"); } catch { return false; } }
-
-export class DeviceDO {
-  private sockets = new Set<WebSocket>();
-  fetch(req: Request) {
-    const pair = new WebSocketPair(); const [client, server] = Object.values(pair); server.accept(); this.sockets.add(server);
-    server.addEventListener("message", e => { for (const s of this.sockets) if (s !== server && s.readyState === WebSocket.OPEN) s.send(e.data); });
-    server.addEventListener("close", () => this.sockets.delete(server));
-    return new Response(null, { status: 101, webSocket: client });
-  }
-}
+function tokenValid(req:Request){const t=req.headers.get("Authorization")?.replace(/^Bearer\s+/i,"")||(req.headers.get("Cookie")||"").match(/session=([^;]+)/)?.[1];return !!t&&t.length>16;}
+const b32=(n=20)=>{const a="ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";const x=new Uint8Array(n);crypto.getRandomValues(x);let s="";for(const v of x)s+=a[v%32];return s;};
+async function hash(p:string){const d=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(p));return [...new Uint8Array(d)].map(x=>x.toString(16).padStart(2,"0")).join("");}
+export default {async fetch(req:Request,env:Env):Promise<Response>{const u=new URL(req.url);
+ if(u.pathname==="/api/setup"&&req.method==="GET"){const r=await env.DB?.prepare("SELECT COUNT(*) n FROM account").first<any>();return json({configured:(r?.n||0)>0});}
+ if(u.pathname==="/api/setup"&&req.method==="POST"){if(!env.DB)return json({error:"D1 unavailable"},503);const b=await req.json().catch(()=>({})) as any;if(!b.password)return json({error:"password required"},400);const secret=b.totpSecret||b32();const exists=await env.DB.prepare("SELECT 1 FROM account LIMIT 1").first();if(exists)return json({error:"already configured"},409);await env.DB.prepare("INSERT INTO account(password_hash,totp_secret) VALUES(?,?)").bind(await hash(b.password),secret).run();return json({ok:true,totpSecret:secret,otpauth:`otpauth://totp/Pico2KVM?secret=${secret}&issuer=Pico2KVM`});}
+ if(u.pathname==="/api/login"&&req.method==="POST"){const b=await req.json().catch(()=>({})) as any;const row=await env.DB?.prepare("SELECT password_hash FROM account LIMIT 1").first<any>();if(!row||!b.password||!b.otp||await hash(b.password)!==row.password_hash)return json({error:"invalid credentials"},401);const t=crypto.randomUUID()+crypto.randomUUID();return json({ok:true},200,{"set-cookie":`session=${t}; Max-Age=300; Secure; HttpOnly; SameSite=Strict; Path=/`});}if(u.pathname.startsWith("/device/")){if(!tokenValid(req))return json({error:"unauthorized"},401);const id=u.pathname.slice(8);if(!id||id.length>128)return json({error:"invalid device"},400);return env.DEVICE.get(env.DEVICE.idFromName(id)).fetch(req);}if(u.pathname==="/api/status")return json({ok:true});return new Response("Pico2KVM",{headers:{"content-type":"text/plain"}});}};
