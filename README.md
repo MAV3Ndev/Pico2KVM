@@ -2,17 +2,19 @@
 
 [日本語](README.ja.md)
 
-A minimal remote KVM (keyboard-only) built on a **Raspberry Pi Pico 2 W**.
+A minimal remote KVM (keyboard-only) built on a **Raspberry Pi Zero 2 W-class
+RP2350 board** (Pico 2 W-compatible firmware; the name comes from the Pi Zero
+2 W form factor the project actually runs on).
 
 Type in a web page → keystrokes travel over TLS → Cloudflare Worker (Durable
-Object relay) → Pico 2 W → the Pico acts as a USB HID keyboard on the target
+Object relay) → the board → it acts as a USB HID keyboard on the target
 machine. The whole path is additionally protected by **end-to-end encryption
 with forward secrecy**, so the relay (or anyone on the path) only ever sees
 ciphertext.
 
 ```
 ┌──────────┐  WSS + E2EE   ┌───────────────────────┐  WSS + E2EE  ┌───────────┐   USB HID   ┌────────┐
-│ Browser  │ ◄───────────► │ Cloudflare Worker (DO)│ ◄──────────► │ Pico 2 W  │ ──────────► │ Target │
+│ Browser  │ ◄───────────► │ Cloudflare Worker (DO)│ ◄──────────► │ Zero 2 W  │ ──────────► │ Target │
 └──────────┘               └───────────────────────┘              └───────────┘             └────────┘
 ```
 
@@ -47,7 +49,7 @@ ciphertext.
 ## Repository layout
 
 ```
-firmware/   Pico 2 W firmware (Pico SDK + TinyUSB + lwIP/altcp + mbedTLS)
+firmware/   RP2350 firmware (Pico SDK + TinyUSB + lwIP/altcp + mbedTLS)
   main.c              boot, Wi-Fi mgmt, HID ring consumption, LED, watchdog
   ws_client.c         WSS client: DNS → TLS(SNI) → WS upgrade → frame loop
   e2e.c / e2e.h       ECDH/ECDSA/HKDF/GCM handshake + frame crypto
@@ -79,8 +81,7 @@ device  → encrypted {"type":"ready"}
 Data frames (WS binary): `[0x02][seq u32 LE][ciphertext][GCM tag 16]`
 
 - Session key: `HKDF-SHA256(ECDH.X, salt=SHA256(pairing) or 32×0,
-  info="pico2kvm-e2e-v1")` (the `pico2kvm` info string is a protocol
-  constant kept for compatibility with already-deployed firmware)
+  info="pico2kvm-e2e-v1")`
 - Nonce (12 B): `[dir][0×7][seq LE]`; dir 0 = browser→device, 1 = reverse
 - Inner payload, browser→device: 8-byte HID report `[0x01][modifier][k1..k6]`
 
@@ -98,8 +99,8 @@ wrangler secret put SESSION_SECRET     # random HMAC secret
 wrangler deploy
 ```
 
-The deployed Worker name in `wrangler.toml`/`SERVER_HOST` is `pico2kvm`
-(the original project name); rename it before first deploy if you like.
+The Worker name in `wrangler.toml`/`SERVER_HOST` is `pico2kvm`; rename it
+before first deploy if you like.
 
 ### Firmware
 

@@ -2,17 +2,19 @@
 
 [English](README.md)
 
-**Raspberry Pi Pico 2 W** で作る最小構成リモート KVM(キーボードのみ)。
+**Raspberry Pi Zero 2 W サイズの RP2350 ボード** で作る最小構成リモート
+KVM(キーボードのみ)。ファームウェアは Pico 2 W 互換(Pico SDK)で、
+プロジェクト名は実際に使っている Pi Zero 2 W フォームファクタ由来です。
 
 Web ページでタイプ → キー入力が TLS 経由で Cloudflare Worker(Durable
-Object リレー)→ Pico 2 W に届き、Pico が USB HID キーボードとして対象
+Object リレー)→ ボードに届き、USB HID キーボードとして対象
 マシンに入力します。経路全体は **forward secrecy 付きのエンドツーエンド
 暗号化(E2EE)** で守られており、リレーや経路上の誰から見ても暗号文しか
 見えません。
 
 ```
 ┌──────────┐  WSS + E2EE   ┌───────────────────────┐  WSS + E2EE  ┌───────────┐   USB HID   ┌────────┐
-│ ブラウザ │ ◄───────────► │ Cloudflare Worker (DO)│ ◄──────────► │ Pico 2 W  │ ──────────► │ 対象PC │
+│ ブラウザ │ ◄───────────► │ Cloudflare Worker (DO)│ ◄──────────► │ Zero 2 W  │ ──────────► │ 対象PC │
 └──────────┘               └───────────────────────┘              └───────────┘             └────────┘
 ```
 
@@ -41,7 +43,7 @@ Object リレー)→ Pico 2 W に届き、Pico が USB HID キーボードとし
 ## 構成
 
 ```
-firmware/   Pico 2 W ファームウェア (Pico SDK + TinyUSB + lwIP/altcp + mbedTLS)
+firmware/   RP2350 ファームウェア (Pico SDK + TinyUSB + lwIP/altcp + mbedTLS)
   main.c              起動、Wi-Fi 管理、HID リング消費、LED、watchdog
   ws_client.c         WSS クライアント: DNS → TLS(SNI+CA検証) → WS upgrade
   e2e.c / e2e.h       ECDH/ECDSA/HKDF/GCM ハンドシェイク + フレーム暗号
@@ -73,8 +75,7 @@ device  → 暗号化 {"type":"ready"}
 データフレーム(WS バイナリ): `[0x02][seq u32 LE][ciphertext][GCM tag 16]`
 
 - セッション鍵: `HKDF-SHA256(ECDH.X, salt=SHA256(pairing) or 32×0,
-  info="pico2kvm-e2e-v1")`(`pico2kvm` の info 文字列はデプロイ済み
-  ファームとの互換のため残したプロトコル定数)
+  info="pico2kvm-e2e-v1")`
 - nonce(12B): `[dir][0×7][seq LE]`、dir 0 = browser→device、1 = 逆
 - browser→device の平文: 8バイト HID レポート `[0x01][modifier][k1..k6]`
 - 任意のペアリングコードを設定すると HKDF salt になり、セッション
@@ -94,8 +95,8 @@ wrangler secret put SESSION_SECRET     # ランダム HMAC シークレット
 wrangler deploy
 ```
 
-`wrangler.toml`/`SERVER_HOST` のデプロイ名は `pico2kvm`(旧プロジェクト名)
-のままです。初回デプロイ前に変えても構いません。
+`wrangler.toml`/`SERVER_HOST` のデプロイ名は `pico2kvm` です。初回
+デプロイ前に変えても構いません。
 
 ### ファームウェア
 

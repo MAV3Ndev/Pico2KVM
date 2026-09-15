@@ -6,7 +6,7 @@ bindings = [{ name = "DEVICE", class_name = "DeviceSession" }]
 [[d1_databases]]
 binding = "DB"
 database_name = "pico2kvm"
-database_id = "0ba032a3-a624-4f97-89d3-8b194d26ff0e"
+database_id = "b41bf237-08af-4b77-99fd-fdeb1e1c9e80"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["DeviceSession"]
