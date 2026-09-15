@@ -2,19 +2,17 @@
 
 [日本語](README.ja.md) · [Detailed communication spec](Detailed-Spec.md) ([日本語](Detailed-Spec.ja.md))
 
-A minimal remote KVM (keyboard-only) built on a **Raspberry Pi Zero 2 W-class
-RP2350 board** (Pico 2 W-compatible firmware; the name comes from the Pi Zero
-2 W form factor the project actually runs on).
+A minimal remote KVM (keyboard-only) built on a **Raspberry Pi Pico 2 W**.
 
 Type in a web page → keystrokes travel over TLS → Cloudflare Worker (Durable
-Object relay) → the board → it acts as a USB HID keyboard on the target
+Object relay) → the Pico 2 W → it acts as a USB HID keyboard on the target
 machine. The whole path is additionally protected by **end-to-end encryption
 with forward secrecy**, so the relay (or anyone on the path) only ever sees
 ciphertext.
 
 ```
 ┌──────────┐  WSS + E2EE   ┌───────────────────────┐  WSS + E2EE  ┌───────────┐   USB HID   ┌────────┐
-│ Browser  │ ◄───────────► │ Cloudflare Worker (DO)│ ◄──────────► │ Zero 2 W  │ ──────────► │ Target │
+│ Browser  │ ◄───────────► │ Cloudflare Worker (DO)│ ◄──────────► │ Pico 2 W  │ ──────────► │ Target │
 └──────────┘               └───────────────────────┘              └───────────┘             └────────┘
 ```
 

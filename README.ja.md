@@ -2,19 +2,17 @@
 
 [English](README.md) · [通信詳細仕様](Detailed-Spec.ja.md) ([English](Detailed-Spec.md))
 
-**Raspberry Pi Zero 2 W サイズの RP2350 ボード** で作る最小構成リモート
-KVM(キーボードのみ)。ファームウェアは Pico 2 W 互換(Pico SDK)で、
-プロジェクト名は実際に使っている Pi Zero 2 W フォームファクタ由来です。
+**Raspberry Pi Pico 2 W** で作る最小構成リモート KVM(キーボードのみ)。
 
 Web ページでタイプ → キー入力が TLS 経由で Cloudflare Worker(Durable
-Object リレー)→ ボードに届き、USB HID キーボードとして対象
+Object リレー)→ Pico 2 W に届き、USB HID キーボードとして対象
 マシンに入力します。経路全体は **forward secrecy 付きのエンドツーエンド
 暗号化(E2EE)** で守られており、リレーや経路上の誰から見ても暗号文しか
 見えません。
 
 ```
 ┌──────────┐  WSS + E2EE   ┌───────────────────────┐  WSS + E2EE  ┌───────────┐   USB HID   ┌────────┐
-│ ブラウザ │ ◄───────────► │ Cloudflare Worker (DO)│ ◄──────────► │ Zero 2 W  │ ──────────► │ 対象PC │
+│ ブラウザ │ ◄───────────► │ Cloudflare Worker (DO)│ ◄──────────► │ Pico 2 W  │ ──────────► │ 対象PC │
 └──────────┘               └───────────────────────┘              └───────────┘             └────────┘
 ```
 
