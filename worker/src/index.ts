@@ -3,6 +3,7 @@ export interface Env {
   DB?: D1Database;
   DEVICE_TOKEN: string;
   SESSION_SECRET: string;
+  SETUP_TOKEN?: string;
   ASSETS: Fetcher;
 }
 
@@ -40,12 +41,17 @@ async function signSession(exp: number, secret: string): Promise<string> {
   return `${exp}.${toHex(await crypto.subtle.sign("HMAC", key, encoder.encode(String(exp))))}`;
 }
 
-async function verifySession(token: string, secret: string): Promise<boolean> {
+// Sessions are also recorded in D1 so /api/logout can actually revoke them;
+// a valid HMAC alone is not sufficient once the cookie may have leaked.
+async function verifySession(token: string, secret: string, db?: D1Database): Promise<boolean> {
   const i = token.lastIndexOf(".");
   if (i <= 0) return false;
   const exp = Number(token.slice(0, i));
   if (!Number.isSafeInteger(exp) || exp <= Date.now()) return false;
-  return timingSafeEq(token, await signSession(exp, secret));
+  if (!(await timingSafeEq(token, await signSession(exp, secret)))) return false;
+  if (!db) return false;
+  const row = await db.prepare("SELECT 1 FROM session WHERE token = ?").bind(token).first();
+  return row !== null;
 }
 
 export class DeviceSession implements DurableObject {
@@ -96,7 +102,8 @@ export class DeviceSession implements DurableObject {
         } else {
           return;
         }
-        const size = typeof data === "string" ? data.length : data.byteLength;
+        const size =
+          typeof data === "string" ? encoder.encode(data).byteLength : data.byteLength;
         if (size > MAX_FRAME) return server.close(1009, "frame too large");
         for (const p of this.sockets.keys())
           if (p !== server && p.readyState === WebSocket.OPEN) p.send(data);
@@ -219,6 +226,7 @@ async function configured(env: Env): Promise<boolean> {
 }
 
 const SECURITY_HEADERS: Record<string, string> = {
+  "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
   "Content-Security-Policy":
     "default-src 'self'; connect-src 'self' wss:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
   "X-Content-Type-Options": "nosniff",
@@ -245,12 +253,21 @@ async function handleRequest(req: Request, env: Env): Promise<Response> {
       if (!env.DB) return json({ error: "D1 unavailable" }, 503);
       const b = (await req.json().catch(() => ({}))) as any;
       if (!b.password) return json({ error: "password required" }, 400);
-      const secret = b.totpSecret || b32();
+      // Optional deploy-time gate: when SETUP_TOKEN is configured the first
+      // account can only be created by whoever holds it.
+      if (env.SETUP_TOKEN && !timingSafeEq(String(b.setupToken || ""), env.SETUP_TOKEN))
+        return json({ error: "setup token required" }, 403);
       const exists = await env.DB.prepare("SELECT 1 FROM account LIMIT 1").first();
       if (exists) return json({ error: "already configured" }, 409);
-      await env.DB.prepare("INSERT INTO account(password_hash,totp_secret) VALUES(?,?)")
-        .bind(await hashPassword(b.password), secret)
-        .run();
+      const secret = b32();
+      try {
+        await env.DB.prepare("INSERT INTO account(password_hash,totp_secret) VALUES(?,?)")
+          .bind(await hashPassword(b.password), secret)
+          .run();
+      } catch {
+        // Concurrent first-run: the CHECK(id=1) PK loses the race.
+        return json({ error: "already configured" }, 409);
+      }
       return json({
         ok: true,
         totpSecret: secret,
@@ -262,15 +279,20 @@ async function handleRequest(req: Request, env: Env): Promise<Response> {
       if (!env.SESSION_SECRET) return json({ error: "SESSION_SECRET not set" }, 503);
       if (!env.DB) return json({ error: "D1 unavailable" }, 503);
       const now = Date.now();
+      // Rate limit per client IP so an attacker cannot burn the global
+      // quota and lock out the legitimate user.
+      const ip = req.headers.get("cf-connecting-ip") || "unknown";
       const recent = await env.DB.prepare(
-        "SELECT COUNT(*) n FROM login_attempt WHERE ts > ?",
+        "SELECT COUNT(*) n FROM login_attempt WHERE ip = ? AND ts > ?",
       )
-        .bind(now - 10 * 60 * 1000)
+        .bind(ip, now - 10 * 60 * 1000)
         .first<{ n: number }>();
       if ((recent?.n || 0) >= 10)
         return json({ error: "too many attempts, try later" }, 429);
       const fail = async () => {
-        await env.DB!.prepare("INSERT INTO login_attempt(ts) VALUES(?)").bind(now).run();
+        await env.DB!.prepare("INSERT INTO login_attempt(ip,ts) VALUES(?,?)")
+          .bind(ip, now)
+          .run();
         await env.DB!.prepare("DELETE FROM login_attempt WHERE ts < ?")
           .bind(now - 10 * 60 * 1000)
           .run();
@@ -287,24 +309,29 @@ async function handleRequest(req: Request, env: Env): Promise<Response> {
         await env.DB.prepare("UPDATE account SET password_hash=? WHERE id=1")
           .bind(v.newHash)
           .run();
-      await env.DB.prepare("DELETE FROM login_attempt").run();
+      await env.DB.prepare("DELETE FROM login_attempt WHERE ip = ?").bind(ip).run();
       const token = await signSession(Date.now() + SESSION_TTL_MS, env.SESSION_SECRET);
+      await env.DB.prepare("INSERT INTO session(token) VALUES(?)").bind(token).run();
       return json({ ok: true }, 200, {
         "set-cookie": `session=${token}; Max-Age=28800; Secure; HttpOnly; SameSite=Strict; Path=/`,
       });
     }
 
     if (u.pathname === "/api/logout" && req.method === "POST") {
+      const token = (req.headers.get("Cookie") || "").match(/session=([^;]+)/)?.[1];
+      if (token && env.DB)
+        await env.DB.prepare("DELETE FROM session WHERE token = ?").bind(token).run();
       return json({ ok: true }, 200, {
         "set-cookie": "session=; Max-Age=0; Secure; HttpOnly; SameSite=Strict; Path=/",
       });
     }
 
-    if (u.pathname === "/api/status") {
+    if (u.pathname === "/api/status" && req.method === "GET") {
       return json({ ok: true, configured: await configured(env) });
     }
 
     if (u.pathname.startsWith("/device/")) {
+      if (req.method !== "GET") return json({ error: "method not allowed" }, 405);
       const id = u.pathname.slice(8);
       if (!id || id.length > 128) return json({ error: "invalid device" }, 400);
       let role: "device" | "browser" | null = null;
@@ -312,7 +339,7 @@ async function handleRequest(req: Request, env: Env): Promise<Response> {
       if (bearer && env.DEVICE_TOKEN && timingSafeEq(bearer, env.DEVICE_TOKEN)) role = "device";
       if (!role) {
         const token = (req.headers.get("Cookie") || "").match(/session=([^;]+)/)?.[1];
-        if (token && env.SESSION_SECRET && (await verifySession(token, env.SESSION_SECRET)))
+        if (token && env.SESSION_SECRET && (await verifySession(token, env.SESSION_SECRET, env.DB)))
           role = "browser";
       }
       if (!role) return json({ error: "unauthorized" }, 401);
