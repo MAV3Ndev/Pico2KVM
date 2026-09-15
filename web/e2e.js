@@ -165,6 +165,11 @@ export class E2ESession {
   async encrypt(dir, plaintext) {
     if (!this.aesKey) return null;
     dir &= 1;
+    if (this.txSeq[dir] >= 0xffffffff) {
+      // Nonce would wrap under this key: force a re-handshake.
+      this.aesKey = null;
+      return null;
+    }
     const seq = this.txSeq[dir]++;
     const ct = new Uint8Array(
       await crypto.subtle.encrypt(

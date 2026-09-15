@@ -198,8 +198,10 @@ async function startE2E(devEpubHex) {
   setE2EReady(false);
   const s = await E2ESession.create();
   session = s;
-  ws.send(JSON.stringify({ type: 'key', pub: s.publicKeyHex() }));
+  // Derive before sending 'key' so a fast 'ready' reply cannot arrive
+  // while aesKey is still null.
   await s.deriveSession(devEpubHex, $('pairing-code').value || undefined);
+  ws.send(JSON.stringify({ type: 'key', pub: s.publicKeyHex() }));
   clearTimeout(readyTimer);
   readyTimer = setTimeout(() => {
     if (!e2eReady) {
@@ -255,6 +257,7 @@ async function handleHello(m) {
     }
   } finally {
     helloBusy = false;
+    helloNonce = null; // this key-req round is done; a peer rejoin may re-arm it
   }
 }
 
@@ -268,6 +271,15 @@ async function onWsMessage(ev) {
     }
     if (m.type === 'peer') {
       setStatus(m.device ? 'デバイス オンライン' : 'リレー接続済み・デバイス待ち');
+      // The device resets its E2E state on every reconnect, so a session we
+      // hold is dead: re-handshake. Skip while a key-req is already in
+      // flight (a second one would invalidate the hello now in transit).
+      if (m.device && !helloNonce) {
+        setE2EReady(false);
+        session = null;
+        helloNonce = randomNonceHex();
+        ws.send(JSON.stringify({ type: 'key-req', nonce: helloNonce }));
+      }
     } else if (m.type === 'hello') {
       void handleHello(m);
     }
