@@ -1,0 +1,60 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        working-directory: worker
+        run: npm ci
+      - name: Typecheck
+        working-directory: worker
+        run: npm run typecheck
+      - name: E2E protocol simulation
+        working-directory: worker
+        run: node scripts/e2e-sim.mjs
+
+  firmware:
+    runs-on: ubuntu-latest
+    env:
+      PICO_SDK_PATH: ${{ github.workspace }}/pico-sdk
+    steps:
+      - uses: actions/checkout@v4
+      # node is required at CMake configure time by firmware/gen_device_key.mjs
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+      - name: Install ARM toolchain (official tarball, gcc 13.3.Rel1)
+        run: |
+          curl -fsSL -o /tmp/arm-toolchain.tar.xz \
+            "https://developer.arm.com/-/media/Files/downloads/gnu/13.3.rel1/binrel/arm-gnu-toolchain-13.3.rel1-x86_64-arm-none-eabi.tar.xz"
+          sudo tar -xJf /tmp/arm-toolchain.tar.xz -C /opt
+          echo "/opt/arm-gnu-toolchain-13.3.rel1-x86_64-arm-none-eabi/bin" >> "$GITHUB_PATH"
+      - name: Clone pico-sdk
+        run: |
+          git clone --depth 1 --branch 2.3.1 https://github.com/raspberrypi/pico-sdk "$PICO_SDK_PATH"
+          git -C "$PICO_SDK_PATH" submodule update --init lib/tinyusb lib/cyw43-driver lib/lwip lib/mbedtls
+      - name: Configure
+        run: |
+          cmake -S firmware -B build -G Ninja \
+            -DPICO_BOARD=pico2_w \
+            -DPICO_SDK_PATH="$PICO_SDK_PATH" \
+            -DWIFI_SSID=ci -DWIFI_PASSWORD=ci -DDEVICE_TOKEN=ci \
+            -DSERVER_HOST=example.workers.dev
+      - name: Build
+        run: cmake --build build
+      - name: Verify UF2 artifact
+        run: test -f build/pico2kvm.uf2
+      - name: Host ws_frame parser test
+        run: |
+          cc -O2 -Wall -o /tmp/ws_frame_test firmware/test/ws_frame_test.c
+          /tmp/ws_frame_test
