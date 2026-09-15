@@ -13,3 +13,6 @@ new_sqlite_classes = ["DeviceSession"]
 [assets]
 directory = "../web"
 binding = "ASSETS"
+# Route every request through the Worker first so it can attach security
+# headers to asset responses too (default: matching assets bypass the Worker).
+run_worker_first = true

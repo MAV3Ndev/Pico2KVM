@@ -123,9 +123,61 @@ const b32 = (n = 20) => {
   return s;
 };
 
-async function hash(p: string) {
-  const d = await crypto.subtle.digest("SHA-256", encoder.encode(p));
-  return toHex(d);
+const PBKDF2_ITERS = 210000;
+
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(Math.floor(hex.length / 2));
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+async function pbkdf2Bits(password: string, salt: Uint8Array, iterations: number) {
+  const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, [
+    "deriveBits",
+  ]);
+  return crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt: salt as BufferSource, iterations },
+    key,
+    256,
+  );
+}
+
+async function hashPassword(password: string): Promise<string> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const bits = await pbkdf2Bits(password, salt, PBKDF2_ITERS);
+  return `pbkdf2$${PBKDF2_ITERS}$${toHex(salt.buffer as ArrayBuffer)}$${toHex(bits)}`;
+}
+
+// Returns { ok } and, for legacy unsalted SHA-256 rows that match, a newHash
+// so the caller can transparently migrate the stored row to PBKDF2.
+async function verifyPassword(
+  password: string,
+  stored: string,
+): Promise<{ ok: boolean; newHash?: string }> {
+  if (stored.startsWith("pbkdf2$")) {
+    const parts = stored.split("$");
+    const iterations = Number(parts[1]);
+    const saltHex = parts[2];
+    const hashHex = parts[3];
+    if (
+      parts.length !== 4 ||
+      !Number.isSafeInteger(iterations) ||
+      iterations <= 0 ||
+      iterations > 1_000_000 ||
+      !/^[0-9a-f]{32}$/i.test(saltHex) ||
+      !/^[0-9a-f]{64}$/i.test(hashHex)
+    )
+      return { ok: false };
+    const bits = await pbkdf2Bits(password, hexToBytes(saltHex), iterations);
+    return { ok: timingSafeEq(toHex(bits), hashHex.toLowerCase()) };
+  }
+  // Legacy format: bare unsalted SHA-256 hex.
+  if (/^[0-9a-f]{64}$/i.test(stored)) {
+    const d = toHex(await crypto.subtle.digest("SHA-256", encoder.encode(password)));
+    if (timingSafeEq(d, stored.toLowerCase()))
+      return { ok: true, newHash: await hashPassword(password) };
+  }
+  return { ok: false };
 }
 
 function b32bytes(s: string) {
@@ -165,8 +217,23 @@ async function configured(env: Env): Promise<boolean> {
   return (r?.n || 0) > 0;
 }
 
-export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+const SECURITY_HEADERS: Record<string, string> = {
+  "Content-Security-Policy":
+    "default-src 'self'; connect-src 'self' wss:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+  "X-Frame-Options": "DENY",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+};
+
+function addSecurityHeaders(res: Response): Response {
+  if (res.status === 101) return res; // WebSocket upgrade response: leave untouched
+  const r = new Response(res.body, res);
+  for (const [k, v] of Object.entries(SECURITY_HEADERS)) r.headers.set(k, v);
+  return r;
+}
+
+async function handleRequest(req: Request, env: Env): Promise<Response> {
     const u = new URL(req.url);
 
     if (u.pathname === "/api/setup" && req.method === "GET") {
@@ -181,7 +248,7 @@ export default {
       const exists = await env.DB.prepare("SELECT 1 FROM account LIMIT 1").first();
       if (exists) return json({ error: "already configured" }, 409);
       await env.DB.prepare("INSERT INTO account(password_hash,totp_secret) VALUES(?,?)")
-        .bind(await hash(b.password), secret)
+        .bind(await hashPassword(b.password), secret)
         .run();
       return json({
         ok: true,
@@ -192,18 +259,34 @@ export default {
 
     if (u.pathname === "/api/login" && req.method === "POST") {
       if (!env.SESSION_SECRET) return json({ error: "SESSION_SECRET not set" }, 503);
+      if (!env.DB) return json({ error: "D1 unavailable" }, 503);
+      const now = Date.now();
+      const recent = await env.DB.prepare(
+        "SELECT COUNT(*) n FROM login_attempt WHERE ts > ?",
+      )
+        .bind(now - 10 * 60 * 1000)
+        .first<{ n: number }>();
+      if ((recent?.n || 0) >= 10)
+        return json({ error: "too many attempts, try later" }, 429);
+      const fail = async () => {
+        await env.DB!.prepare("INSERT INTO login_attempt(ts) VALUES(?)").bind(now).run();
+        await env.DB!.prepare("DELETE FROM login_attempt WHERE ts < ?")
+          .bind(now - 10 * 60 * 1000)
+          .run();
+        return json({ error: "invalid credentials" }, 401);
+      };
       const b = (await req.json().catch(() => ({}))) as any;
-      const row = await env.DB?.prepare(
+      const row = await env.DB.prepare(
         "SELECT password_hash,totp_secret FROM account LIMIT 1",
       ).first<{ password_hash: string; totp_secret: string }>();
-      if (
-        !row ||
-        !b.password ||
-        !b.otp ||
-        (await hash(b.password)) !== row.password_hash ||
-        !(await totp(row.totp_secret, String(b.otp)))
-      )
-        return json({ error: "invalid credentials" }, 401);
+      if (!row || !b.password || !b.otp) return fail();
+      const v = await verifyPassword(b.password, row.password_hash);
+      if (!v.ok || !(await totp(row.totp_secret, String(b.otp)))) return fail();
+      if (v.newHash)
+        await env.DB.prepare("UPDATE account SET password_hash=? WHERE id=1")
+          .bind(v.newHash)
+          .run();
+      await env.DB.prepare("DELETE FROM login_attempt").run();
       const token = await signSession(Date.now() + SESSION_TTL_MS, env.SESSION_SECRET);
       return json({ ok: true }, 200, {
         "set-cookie": `session=${token}; Max-Age=28800; Secure; HttpOnly; SameSite=Strict; Path=/`,
@@ -238,5 +321,10 @@ export default {
     }
 
     return env.ASSETS.fetch(req);
+}
+
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    return addSecurityHeaders(await handleRequest(req, env));
   },
 };
