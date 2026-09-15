@@ -1,6 +1,6 @@
 # Pico2KVM
 
-[English](README.md)
+[English](README.md) · [通信詳細仕様](Detailed-Spec.ja.md) ([English](Detailed-Spec.md))
 
 **Raspberry Pi Zero 2 W サイズの RP2350 ボード** で作る最小構成リモート
 KVM(キーボードのみ)。ファームウェアは Pico 2 W 互換(Pico SDK)で、
@@ -60,6 +60,8 @@ web/        依存ゼロの Web UI(ES modules + WebCrypto のみ)
 ```
 
 ## ワイヤープロトコル
+
+完全な仕様は [Detailed-Spec.ja.md](Detailed-Spec.ja.md) を参照。
 
 ハンドシェイク(平文 WS テキスト):
 

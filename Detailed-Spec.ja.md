@@ -1,0 +1,233 @@
+# Pico2KVM — 通信詳細仕様
+
+[English](Detailed-Spec.md)
+
+ブラウザ・Cloudflare Worker・RP2350 デバイス間でバイトがどう流れるかを、
+認証・フレーミング・E2E ハンドシェイク・再送制御・全タイマー/定数まで
+正確に解説するドキュメントです。
+
+## 1. トポロジ
+
+```
+┌──────────┐   HTTPS/WSS    ┌────────────────────────┐   WSS(デバイス起点)   ┌─────────┐   USB HID   ┌────────┐
+│ ブラウザ │ ◄────────────► │ Worker → DeviceSession │ ◄──────────────────► │ RP2350  │ ──────────► │ 対象PC │
+└──────────┘                │ Durable Object (リレー)│                       │ ボード  │  キーボード │        │
+                            └────────────────────────┘                       └─────────┘             └────────┘
+```
+
+- **デバイスは常に外向きに接続**する: Wi-Fi STA → DNS → TCP 443 → TLS →
+  WS アップグレード。受信リスナーは存在せず、NAT/ファイアウォール越しでも
+  動きます。
+- **ブラウザ**も同じ Worker オリジンへ WSS で接続。
+- `/device/:id` で名付けられた **Durable Object** は、最大1本のデバイス
+  ソケットと最大1本のブラウザソケットの間の単純なバイト中継。
+- **暗号は独立した2層**:
+  1. 両 WebSocket 区間の TLS(デバイス↔Worker は GTS Root R4 ピン留め)
+  2. WebSocket ペイロード**内部**の E2E 暗号 — リレーや経路上の観察者には
+     常に暗号文しか見えない
+
+## 2. HTTP レイヤ(Worker)
+
+`worker/src/index.ts` のルーティング:
+
+| ルート | メソッド | 認証 | 用途 |
+|---|---|---|---|
+| `GET /api/setup` | GET | なし | `{configured: bool}` |
+| `POST /api/setup` | POST | なし・初回のみ | アカウント作成、TOTP シークレット+otpauth URI を返す |
+| `POST /api/login` | POST | パスワード+TOTP | `session` Cookie を発行 |
+| `POST /api/logout` | POST | — | Cookie 破棄 |
+| `GET /api/status` | GET | なし | `{ok, configured}` |
+| `/device/:id` | GET(Upgrade) | デバイス: `Authorization: Bearer <DEVICE_TOKEN>`、ブラウザ: `session` Cookie | DO へ転送 |
+| その他 | GET | なし | 静的アセット(セキュリティヘッダ付与のため Worker 経由) |
+
+### ログインまわり
+
+- パスワードは `pbkdf2$<iters>$<salt_hex>$<hash_hex>` 形式で保存
+  (PBKDF2-SHA-256、10万回 — Workers WebCrypto の上限 — 、16B salt、
+  256bit 出力)。旧形式(無 salt SHA-256)の行は一度だけ検証され、
+  次回のログイン成功時に PBKDF2 形式へ自動書き換え。
+- レートリミット: 10分間のローリングウィンドウで最大10回の失敗まで
+  (`login_attempt` テーブル)。超過は 429。ログイン成功でテーブル全消去。
+- セッショントークン: `<exp_ms>.<HMAC-SHA256(exp)>` を `SESSION_SECRET`
+  で署名。Cookie は `Secure; HttpOnly; SameSite=Strict`、有効期間 8時間。
+- 101 Upgrade 以外の全レスポンスにセキュリティヘッダ:
+  `Content-Security-Policy`、`X-Content-Type-Options`、`Referrer-Policy`、
+  `X-Frame-Options`、`Permissions-Policy`。
+
+## 3. WebSocket 区間: ブラウザ ↔ Worker ↔ デバイス
+
+### 3.1 デバイス側接続(ファーム `ws_client.c`)
+
+```
+GET /device/<id> HTTP/1.1
+Host: <server>
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: <b64 16B>
+Sec-WebSocket-Version: 13
+Authorization: Bearer <DEVICE_TOKEN>
+User-Agent: pico2kvm
+```
+
+- 先に TLS: `altcp_tls` + mbedTLS、`VERIFY_REQUIRED`、SNI =
+  `SERVER_HOST`、チェーンは埋め込み `gtsr4.pem`(GTS Root R4 —
+  `*.workers.dev` の発行元 CA)にピン留め。証明書の有効期限は
+  `BUILD_EPOCH + 起動からの経過時間` で検証(ボードに RTC が無いため)。
+- HTTP 応答はステータス行(`HTTP/1.1 101`)のみ検査。`\r\n\r\n` までの
+  ヘッダは pending バッファ(最大2048B)で消費。
+- クライアント→サーバのフレームは RFC 6455 通りマスク付き
+  (xorshift32 PRNG でマスク生成)。
+- サーバ→クライアントのフレームはファーム側でアンマスクしてから処理。
+
+### 3.2 ブラウザ側接続
+
+`new WebSocket("wss://<host>/device/default")` — session Cookie が自動で
+載る。ブラウザの WS API は追加ヘッダを付けられないため、デバイス役は
+`Authorization`、ブラウザ役は Cookie で認証する、という非対称設計。
+
+### 3.3 Durable Object リレー(`DeviceSession`)
+
+- 役割は Worker が付ける内部ヘッダ `X-Pico2KVM-Role` で伝達。
+- 役割ごとにソケット1本。同じ役割の新規接続は**既存を置き換える**
+  (旧ソケットは code 1000 "replaced" で close)。
+- ブラウザ接続時に `{"type":"peer","device":<bool>}` を送信。
+  デバイスソケットの接続/切断時には全ブラウザへ
+  `{"type":"peer","device":true|false}` を通知。
+- メッセージ転送: 片方のソケットのフレームを反対側へそのまま転送。
+  `Blob`/`ArrayBufferView` は先に `ArrayBuffer` へ正規化(Cloudflare は
+  バイナリを `Blob` で渡す; 生で送ると `"[object Blob]"` 文字列になる)。
+- `MAX_FRAME = 16384` バイト超のフレームは送信側ソケットを 1009 で
+  close。内容の検査は一切なし — DO は平文を見ない。
+
+## 4. E2E ハンドシェイク
+
+ハンドシェイクのメッセージはすべて平文の WS **テキスト**フレームで、
+DO 経由でリレーされる。ブラウザ側の手順(`web/app.js`):
+
+```
+ブラウザ ──WS open──► {"type":"key-req","nonce":"<32 hex>"} を送信 (16B乱数)
+デバイス ──text────►  {"type":"hello","fw":"pico2kvm",
+                       "spub":"<130 hex>",      // 静的 P-256 公開鍵 0x04||X||Y
+                       "epub":"<130 hex>",      // 毎回生成のエフェメラル公開鍵
+                       "sig":"<128 hex>"}       // ECDSA r||s
+                        sig = ECDSA-SHA256(静的秘密鍵, SHA256(nonce_bytes || epub_bytes))
+ブラウザ: 1. fingerprint = SHA256(spub) → localStorage のピン留めと照合
+          2. spub で sig を検証(静的鍵の保有証明)
+          3. 初回のみ: フィンガープリントを画面表示しユーザー確認(TOFU)
+          4. ──text──► {"type":"key","pub":"<130 hex ブラウザエフェメラル>"}
+デバイス:  ECDH(eph_d, browser_pub) → HKDF → AES-256-GCM 鍵
+           ──binary──► {"type":"ready"} の E2E フレーム
+ブラウザ:  ready を復号 → 「E2E 接続済み」(5秒でタイムアウト)
+```
+
+要点:
+
+- **静的鍵は認証専用**。署名に使い、暗号化には使わない。ファーム
+  configure 時に一度だけ `device_key.h` へ生成される(gitignore 済み)。
+- **Forward secrecy**: ECDH の共有秘密は両側エフェメラル鍵から導出。
+  デバイスは `key-req` のたびにエフェメラル鍵ペアを再生成し、切断・
+  再鍵交換時にゼロ化する。
+- **nonce が署名をこのハンドシェイクに紐付け**るため、hello のリプレイは
+  新しい `key-req` には使えない。
+- **TOFU ピン留め**: `SHA256(spub)` をユーザー確認後に
+  `pico2kvm-fp-default` として localStorage に保存。以後の不一致は
+  ECDH 前に中断。
+- **ペアリングコード**(任意): ファームを `-DPAIRING_CODE` 付きで
+  ビルドすると `e2e_salt = SHA256(UTF8(code))`、未設定なら32Bのゼロ。
+  ブラウザは入力欄から同じ salt を導出。コードが違うと鍵も違うため
+  `ready` が復号できずハンドシェイク失敗になる。
+
+### セッション鍵導出
+
+```
+shared = ECDH(エフェメラル同士) の X 座標   (32B)
+key    = HKDF-SHA256(ikm=shared, salt=上記参照, info="pico2kvm-e2e-v1", 32)
+cipher = AES-256-GCM
+```
+
+## 5. E2E データフレーム
+
+WS **バイナリ**フレーム。ワイヤー形式:
+
+```
+[0x02][seq: u32 LE][ciphertext][GCM tag: 16B]
+   0        1..4          5..        末尾16
+```
+
+- `seq` は方向ごとの単調増加カウンタで、ハンドシェイクごとに 0 に
+  リセット(両側で `txSeq`/`rxSeqMax` を再初期化)。
+- **nonce(12B)**: `[dir][ゼロ7B][seq u32 LE]`。
+  `dir` 0 = ブラウザ→デバイス、1 = デバイス→ブラウザ。方向分離により
+  両側で nonce が衝突しない。
+- **リプレイ拒否**: `seq <= 受信済み最大値` は復号前にドロップ。
+  (厳密な単調増加。並び替え窓は無い — TCP が順序を保証するため)
+- **ダウングレード防止**: デバイスは `0x02` で始まりちょうど
+  `21+8` バイトのバイナリフレームしか受け付けない。仮に平文の `0x01`
+  レポートが来ても黙って捨てる。
+- 内部平文(ブラウザ→デバイス): 8バイト HID キーボードレポート
+  `[0x01][修飾ビットマップ][key1..key6]`(boot protocol 形式)。
+  デバイス→ブラウザ方向は予約(現状 `{"type":"ready"}` の JSON のみ)。
+
+## 6. ファームの状態機械
+
+### 6.1 Wi-Fi(`main.c`)
+
+- リンクダウン中は `cyw43_arch_wifi_connect_async` を **10秒ごと**に
+  再試行(1秒ごとにリンク確認)。
+- ウォッチドッグ 8秒。メインループが毎回 feed。
+
+### 6.2 WebSocket クライアント(`ws_client.c`)
+
+```
+WS_IDLE ──リンク確立──► WS_DNS ──► WS_CONNECTING ──► WS_HANDSHAKE ──101──► WS_OPEN
+   ▲                                                                              │
+   └───────────────── WS_BACKOFF ◄── あらゆるエラー/タイムアウト/close ◄────────────┘
+```
+
+タイマー一覧:
+
+| 定数 | 値 | 意味 |
+|---|---|---|
+| `WS_PING_MS` | 20 000 | アイドル時のクライアント ping |
+| `WS_RX_TIMEOUT_MS` | 60 000 | 受信が無いと再接続 |
+| `WS_HS_TIMEOUT_MS` | 15 000 | アップグレードの完了期限 |
+| `WS_BACKOFF_INIT_MS` | 2 000 | 初回リトライ待ち |
+| `WS_BACKOFF_MAX_MS` | 30 000 | 倍増の上限 |
+
+- `WS_BACKOFF` への遷移ごとに `e2e_reset()`(エフェメラル鍵破棄・
+  シーケンスカウンタ消去 — 次のブラウザは再ハンドシェイク必須)と、
+  全キー解放レポートをキューに積む(対象 PC でキーが押しっぱなしに
+  ならないように)。
+- 受信レポートは16エントリの SPSC リング(コールバック→メインループ)
+  を経由。満杯なら最新のレポートを落とす。
+- 巨大な受信 WS ペイロードはバッファせず `ws_skip_len` で読み飛ばす
+  (pending バッファは 2KiB)。
+
+### 6.3 USB HID(`main.c`)
+
+- `tud_hid_ready()` の間、ポップしたレポートごとに
+  `tud_hid_keyboard_report(0, modifier, keys)` を呼ぶ。
+- LED: **消灯** = Wi-Fi リンク無し · **500ms 点滅** = Wi-Fi 接続済み・
+  WS 未確立 · **点灯** = WS オープン。
+
+## 7. ブラウザ送信経路(`web/app.js`)
+
+- 物理位置マッピング: `KeyboardEvent.code` → HID usage(US 配列 +
+  JIS の `IntlRo`/`IntlYen`/`Convert` 等)。修飾ビットは別途追跡し、
+  状態変化ごとに完全なレポートを1通送る。
+- 送信は promise チェーン(`queueSend`)で直列化し、`seq` 番号と
+  ワイヤー上の順序が常に一致するようにする。
+- `blur` / WS close → `releaseAll()`(空レポート)で押下キーを解除。
+- テキスト送信は各 ASCII 文字を押下+解放として 20ms 間隔で打鍵。
+- ボタン: Enter/Backspace/Tab/Esc/Ctrl+Alt+Del/Win を `sendRaw` で送信。
+
+## 8. 主な失敗モード
+
+| 症状 | 原因 |
+|---|---|
+| `E2E 確立失敗` | ペアリングコードの不一致/未入力、または 5秒以内に `ready` が復号できない |
+| `フィンガープリント不一致!` | デバイス静的鍵の変更または MITM — 鍵交換の前に中断 |
+| `ファームウェアが古い` | hello に `epub`/`sig` が無い(FS 前のファーム) |
+| 対象 PC でキーが押しっぱなし | ファーム稼働中は原理的に起きない: WS 切断のたびに release-all をキュー投入。押下中のハードな電源断のみ起こり得る |
+| 数年後に TLS 失敗 | 埋め込み `BUILD_EPOCH` が証明書の有効期間外 — 再ビルド&再書き込み |
+| ログインで 429 | 10分で10回超の失敗 |

@@ -1,6 +1,6 @@
 # Pico2KVM
 
-[日本語](README.ja.md)
+[日本語](README.ja.md) · [Detailed communication spec](Detailed-Spec.md) ([日本語](Detailed-Spec.ja.md))
 
 A minimal remote KVM (keyboard-only) built on a **Raspberry Pi Zero 2 W-class
 RP2350 board** (Pico 2 W-compatible firmware; the name comes from the Pi Zero
@@ -66,6 +66,8 @@ web/        Zero-dependency web UI (ES modules, WebCrypto only)
 ```
 
 ## Wire protocol
+
+See [Detailed-Spec.md](Detailed-Spec.md) for the full specification.
 
 Handshake (plaintext WS text frames):
 
