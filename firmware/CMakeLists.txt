@@ -11,6 +11,19 @@ set(DEVICE_TOKEN "" CACHE STRING "Device bearer token")
 set(SERVER_HOST "pico2kvm.konekosann.workers.dev" CACHE STRING "KVM server host")
 set(SERVER_PORT "443" CACHE STRING "KVM server port")
 set(DEVICE_ID "default" CACHE STRING "Device id path segment")
+set(PAIRING_CODE "" CACHE STRING "Optional pairing code mixed into the E2E HKDF salt")
+
+# Embed the trusted root CA as a C string literal: each PEM line becomes a
+# "line\n" \ fragment (backslash-continued) so configure_file can expand
+# it verbatim into config.h as a single multi-line #define.
+file(READ ${CMAKE_CURRENT_LIST_DIR}/gtsr4.pem CA_PEM)
+string(REPLACE "\r\n" "\n" CA_PEM "${CA_PEM}")
+string(REPLACE "\n" "\\n\" \\\n\"" CA_PEM "${CA_PEM}")
+
+# Build timestamp: provides a plausible wall-clock base for time() so TLS
+# certificate notBefore/notAfter checks work without an RTC.
+string(TIMESTAMP BUILD_EPOCH "%s" UTC)
+
 configure_file(${CMAKE_CURRENT_LIST_DIR}/config.h.in
                ${CMAKE_CURRENT_BINARY_DIR}/generated/config.h @ONLY)
 

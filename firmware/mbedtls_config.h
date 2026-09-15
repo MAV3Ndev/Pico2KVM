@@ -14,8 +14,10 @@
 #define MBEDTLS_ALLOW_PRIVATE_ACCESS
 /* Required by the SDK's patched altcp_tls_mbedtls.c, which reads
  * mbedtls_ssl_session.start unconditionally (the member is HAVE_TIME-gated).
- * ws_client.c provides a boot-relative time() so no RTC is needed. */
+ * HAVE_TIME_DATE enables certificate notBefore/notAfter checks; the Pico
+ * has no RTC, so ws_client.c provides a time() based on the build epoch. */
 #define MBEDTLS_HAVE_TIME
+#define MBEDTLS_HAVE_TIME_DATE
 #define MBEDTLS_PLATFORM_MS_TIME_ALT
 #define MBEDTLS_SSL_SERVER_NAME_INDICATION
 #define MBEDTLS_SSL_EXTENDED_MASTER_SECRET
@@ -38,6 +40,7 @@
 #define MBEDTLS_AES_C
 #define MBEDTLS_ASN1_PARSE_C
 #define MBEDTLS_ASN1_WRITE_C
+#define MBEDTLS_BASE64_C
 #define MBEDTLS_BIGNUM_C
 #define MBEDTLS_CHACHA20_C
 #define MBEDTLS_CHACHAPOLY_C
@@ -52,6 +55,7 @@
 #define MBEDTLS_HKDF_C
 #define MBEDTLS_MD_C
 #define MBEDTLS_OID_C
+#define MBEDTLS_PEM_PARSE_C
 #define MBEDTLS_PK_C
 #define MBEDTLS_PK_PARSE_C
 #define MBEDTLS_PLATFORM_C

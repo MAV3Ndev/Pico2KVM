@@ -33,5 +33,6 @@
 #define LWIP_ALTCP                      1
 #define LWIP_ALTCP_TLS                  1
 #define LWIP_ALTCP_TLS_MBEDTLS          1
-/* No CA is provisioned in v1; verification is off. */
-#define ALTCP_MBEDTLS_AUTHMODE          MBEDTLS_SSL_VERIFY_NONE
+/* The GTS R4 root CA is embedded via PICO2KVM_CA_PEM: require full chain
+ * and hostname verification against it. */
+#define ALTCP_MBEDTLS_AUTHMODE          MBEDTLS_SSL_VERIFY_REQUIRED

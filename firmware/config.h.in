@@ -6,3 +6,15 @@
 #define PICO2KVM_SERVER_PORT @SERVER_PORT@
 #define PICO2KVM_DEVICE_ID "@DEVICE_ID@"
 #define PICO2KVM_DEVICE_TOKEN "@DEVICE_TOKEN@"
+
+/* Trusted root CA (GTS Root R4) for TLS server verification, expanded by
+ * CMake into a concatenated C string literal ("line\n" per PEM line). */
+#define PICO2KVM_CA_PEM "@CA_PEM@"
+
+/* Unix time of the firmware build. Used as the time() base for
+ * certificate notBefore/notAfter checks (the Pico has no RTC). */
+#define PICO2KVM_BUILD_EPOCH @BUILD_EPOCH@
+
+/* Optional pairing code mixed into the E2E HKDF salt; "" = legacy zero
+ * salt (pairing check disabled). */
+#define PICO2KVM_PAIRING_CODE "@PAIRING_CODE@"

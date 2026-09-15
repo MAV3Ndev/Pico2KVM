@@ -26,11 +26,13 @@
 #include <stdio.h>
 #include <time.h>
 
-/* mbedtls is built with MBEDTLS_HAVE_TIME; provide a boot-relative time().
- * Certificate validity is never checked (VERIFY_NONE), so epoch accuracy
- * does not matter. */
+/* mbedtls is built with MBEDTLS_HAVE_TIME_DATE, so certificate
+ * notBefore/notAfter are checked against time(). The Pico has no RTC:
+ * report the firmware build epoch plus uptime, which always sits inside
+ * the CA's and server cert's validity window. */
 time_t time(time_t *t) {
-  time_t v = (time_t)(time_us_64() / 1000000);
+  time_t v = (time_t)PICO2KVM_BUILD_EPOCH +
+             (time_t)(time_us_64() / 1000000);
   if (t) *t = v;
   return v;
 }
@@ -500,9 +502,11 @@ void ws_client_init(void) {
   prng_state = (uint32_t)get_rand_64();
   if (!prng_state) prng_state = 0x9e3779b9u;
   e2e_init();
-  /* TODO: pin CA */
   cyw43_arch_lwip_begin();
-  ws_tls_config = altcp_tls_create_config_client(NULL, 0);
+  /* sizeof includes the trailing NUL: mbedtls only detects PEM when the
+   * buffer's last byte is '\0'. */
+  ws_tls_config = altcp_tls_create_config_client(
+      (const uint8_t *)PICO2KVM_CA_PEM, sizeof(PICO2KVM_CA_PEM));
   cyw43_arch_lwip_end();
   ws_state = WS_IDLE;
   ws_next_try_ms = now_ms();

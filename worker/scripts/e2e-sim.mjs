@@ -23,6 +23,10 @@ import {
 
 const INFO = Buffer.from('pico2kvm-e2e-v1');
 const SALT = Buffer.alloc(32); // 32 zero bytes, per spec
+// HKDF salt when a pairing code is configured (mirrors firmware/e2e.c:
+// salt = SHA256(UTF8(code)), empty code = 32 zero bytes).
+const pairingSalt = (code) =>
+  code ? createHash('sha256').update(code, 'utf8').digest() : SALT;
 
 let failures = 0;
 const ok = (cond, name) => {
@@ -36,12 +40,13 @@ const jwkPubToRaw = (jwk) =>
 
 // --- device emulation (mirrors firmware/e2e.c) ---
 class DeviceSim {
-  constructor() {
+  constructor(pairingCode = '') {
     // Static identity key: ECDSA signing only (forward secrecy).
     this.staticPair = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
     this.spub = jwkPubToRaw(
       this.staticPair.publicKey.export({ format: 'jwk' }),
     ); // 65B 0x04||X||Y
+    this.salt = pairingSalt(pairingCode); // e2e_salt in firmware
     this.eph = null; // ephemeral ECDH, per handshake
     this.resetSession();
   }
@@ -81,7 +86,7 @@ class DeviceSim {
     }
     if (m.type === 'key' && typeof m.pub === 'string' && this.eph) {
       const shared = this.eph.computeSecret(Buffer.from(m.pub, 'hex')); // X coord, 32B
-      this.key = Buffer.from(hkdfSync('sha256', shared, SALT, INFO, 32));
+      this.key = Buffer.from(hkdfSync('sha256', shared, this.salt, INFO, 32));
       this.txSeq = [0, 0];
       this.rxSeen = false;
       this.rxSeqMax = 0;
@@ -279,6 +284,86 @@ const readyFrame3 = dev.handleText(
 await session2.deriveSession(hello3.epub);
 const r3 = await session2.decrypt(readyFrame3);
 ok(r3 && r3.seq === 0, 'fresh session accepts new ready at seq 0');
+
+// --- 7. optional pairing code: salt = SHA256(UTF8(code)) ---
+const pairCode = 'test-pairing-1234';
+const pdev = new DeviceSim(pairCode);
+const pnonce = newNonce();
+const phello = JSON.parse(
+  pdev.handleText(JSON.stringify({ type: 'key-req', nonce: pnonce })),
+);
+ok(
+  await verifyDeviceSig(phello.spub, pnonce, phello.epub, phello.sig),
+  'pairing code: hello signature still verifies (code only affects HKDF salt)',
+);
+const pSession = await E2ESession.create();
+const pReady = pdev.handleText(
+  JSON.stringify({ type: 'key', pub: pSession.publicKeyHex() }),
+);
+await pSession.deriveSession(phello.epub, pairCode);
+const pDec = await pSession.decrypt(pReady);
+ok(
+  pDec && JSON.parse(td.decode(pDec.plaintext)).type === 'ready',
+  'pairing code: matching code establishes session',
+);
+const pReport = await pSession.encrypt(0, report);
+const pReportDec = pdev.decrypt(Buffer.from(pReport));
+ok(
+  pReportDec && pReportDec.equals(Buffer.from(report)),
+  'pairing code: HID report round trips with matching code',
+);
+
+// wrong code on the browser side: derived keys differ, ready never
+// decrypts and device-side report decryption fails.
+const wdev = new DeviceSim(pairCode);
+const whello = JSON.parse(
+  wdev.handleText(JSON.stringify({ type: 'key-req', nonce: newNonce() })),
+);
+const wSession = await E2ESession.create();
+const wReady = wdev.handleText(
+  JSON.stringify({ type: 'key', pub: wSession.publicKeyHex() }),
+);
+await wSession.deriveSession(whello.epub, 'wrong-code');
+ok(
+  (await wSession.decrypt(wReady)) === null,
+  'pairing code: mismatched code fails to decrypt ready',
+);
+const wReport = await wSession.encrypt(0, report);
+ok(
+  wdev.decrypt(Buffer.from(wReport)) === null,
+  'pairing code: device rejects report under mismatched salt',
+);
+
+// device has a code, browser provides none: same failure mode.
+const ndev = new DeviceSim(pairCode);
+const nhello = JSON.parse(
+  ndev.handleText(JSON.stringify({ type: 'key-req', nonce: newNonce() })),
+);
+const nSession = await E2ESession.create();
+const nReady = ndev.handleText(
+  JSON.stringify({ type: 'key', pub: nSession.publicKeyHex() }),
+);
+await nSession.deriveSession(nhello.epub); // no pairing code
+ok(
+  (await nSession.decrypt(nReady)) === null,
+  'pairing code: device configured, browser omits code -> fails',
+);
+
+// device without a code, browser supplies one: also fails (both sides
+// must agree).
+const cdev = new DeviceSim();
+const chello = JSON.parse(
+  cdev.handleText(JSON.stringify({ type: 'key-req', nonce: newNonce() })),
+);
+const cSession = await E2ESession.create();
+const cReady = cdev.handleText(
+  JSON.stringify({ type: 'key', pub: cSession.publicKeyHex() }),
+);
+await cSession.deriveSession(chello.epub, 'unexpected-code');
+ok(
+  (await cSession.decrypt(cReady)) === null,
+  'pairing code: browser supplies code for unpaired device -> fails',
+);
 
 console.log(failures ? `${failures} FAILURES` : 'ALL PASS');
 process.exit(failures ? 1 : 0);

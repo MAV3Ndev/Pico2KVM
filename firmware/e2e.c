@@ -8,8 +8,10 @@
  *       sig = ECDSA-SHA256(static_priv, SHA256(nonce || epub))
  *     browser->device {"type":"key","pub":"<130 hex>"}
  *   data (WS binary): [0x02][seq u32 LE][ciphertext][GCM tag 16]
- *   session key: HKDF-SHA256(ECDH(ephemeral).X-coord, salt=32*0,
- *                             "pico2kvm-e2e-v1")  — HKDF info string kept
+ *   session key: HKDF-SHA256(ECDH(ephemeral).X-coord,
+ *                             salt=SHA256(pairing code) or 32*0 when no
+ *                             code is configured, "pico2kvm-e2e-v1")
+ *   — HKDF info string kept
  *   for compatibility with already-deployed firmware; forward secrecy:
  *   the
  *   static key only signs, never encrypts.
@@ -22,6 +24,7 @@
 
 #include "e2e.h"
 #include "device_key.h"
+#include "config.h"
 
 #include "mbedtls/entropy.h"
 #include "mbedtls/ctr_drbg.h"
@@ -52,6 +55,10 @@ static mbedtls_mpi e2e_d;        /* static private key: ECDSA only */
 static mbedtls_mpi e2e_de;       /* ephemeral ECDH private key */
 static mbedtls_ecp_point e2e_qe; /* ephemeral ECDH public point */
 static mbedtls_gcm_context e2e_gcm;
+
+/* HKDF salt: all zeros, or SHA256(pairing code) when one is configured.
+ * A browser must present the same code to derive the session key. */
+static uint8_t e2e_salt[32];
 
 static bool e2e_ok;        /* init succeeded */
 static bool e2e_is_ready;  /* session key established */
@@ -126,6 +133,13 @@ void e2e_init(void) {
   e2e_is_ready = false;
   e2e_have_eph = false;
   e2e_hello_len = 0;
+
+  if (PICO2KVM_PAIRING_CODE[0]) {
+    mbedtls_sha256((const uint8_t *)PICO2KVM_PAIRING_CODE,
+                   sizeof(PICO2KVM_PAIRING_CODE) - 1, e2e_salt, 0);
+  } else {
+    memset(e2e_salt, 0, sizeof e2e_salt);
+  }
 
   int rc = mbedtls_ctr_drbg_seed(&e2e_drbg, mbedtls_entropy_func,
                                  &e2e_entropy, NULL, 0);
@@ -224,8 +238,6 @@ static void e2e_establish(const uint8_t peer_pub[65]) {
   mbedtls_mpi_init(&z);
   uint8_t shared[32];
   uint8_t key[32];
-  uint8_t salt[32];
-  memset(salt, 0, sizeof salt);
 
   if (!e2e_have_eph) {
     printf("e2e: key before key-req, ignored\n");
@@ -241,8 +253,8 @@ static void e2e_establish(const uint8_t peer_pub[65]) {
                                      mbedtls_ctr_drbg_random, &e2e_drbg);
   if (!rc) rc = mbedtls_mpi_write_binary(&z, shared, sizeof shared);
   if (!rc)
-    rc = mbedtls_hkdf(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), salt,
-                      sizeof salt, shared, sizeof shared,
+    rc = mbedtls_hkdf(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+                      e2e_salt, sizeof e2e_salt, shared, sizeof shared,
                       (const uint8_t *)E2E_INFO, E2E_INFO_LEN, key,
                       sizeof key);
   if (!rc)

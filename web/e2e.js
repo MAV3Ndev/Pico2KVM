@@ -1,8 +1,10 @@
 // Browser side of the Pico2KVM E2E channel (WebCrypto only; works in the
 // browser and in Node >= 20 via globalThis.crypto.subtle — no Buffer).
 //
-//   session key: HKDF-SHA256(ECDH-P256 X-coord, salt=32*0,
-//                            info="pico2kvm-e2e-v1") -> AES-256-GCM
+//   session key: HKDF-SHA256(ECDH-P256 X-coord, info="pico2kvm-e2e-v1",
+//                            salt = SHA256(UTF8(pairingCode)) if a
+//                            pairing code is configured on the device,
+//                            else 32 zero bytes) -> AES-256-GCM
 //   frame:       [0x02][seq u32 LE][ciphertext][GCM tag 16]
 //   nonce:       [dir][0 x7][seq u32 LE]; dir 0 = browser->device,
 //                1 = device->browser.
@@ -117,7 +119,10 @@ export class E2ESession {
 
   // devEpubHex: the device's EPHEMERAL public key from the signed hello
   // (forward secrecy) — not the long-term static key.
-  async deriveSession(devEpubHex) {
+  // pairingCode: optional; when set the HKDF salt is SHA256(UTF8(code))
+  // instead of 32 zero bytes, matching the firmware. A wrong code yields
+  // a wrong key, so the device's encrypted "ready" never decrypts.
+  async deriveSession(devEpubHex, pairingCode) {
     const devPub = hexToBytes(devEpubHex);
     if (!devPub || devPub.length !== 65 || devPub[0] !== 0x04)
       throw new Error('invalid device ephemeral public key');
@@ -133,11 +138,16 @@ export class E2ESession {
       this.kp.privateKey,
       256,
     );
+    const salt = pairingCode
+      ? new Uint8Array(
+          await crypto.subtle.digest('SHA-256', te.encode(pairingCode)),
+        )
+      : HKDF_SALT;
     const ikm = await crypto.subtle.importKey('raw', shared, 'HKDF', false, [
       'deriveKey',
     ]);
     this.aesKey = await crypto.subtle.deriveKey(
-      { name: 'HKDF', hash: 'SHA-256', salt: HKDF_SALT, info: HKDF_INFO },
+      { name: 'HKDF', hash: 'SHA-256', salt, info: HKDF_INFO },
       ikm,
       { name: 'AES-GCM', length: 256 },
       false,

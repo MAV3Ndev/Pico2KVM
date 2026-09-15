@@ -183,6 +183,15 @@ $('logout').onclick = async () => {
   $('login').hidden = false;
 };
 
+// ペアリングコード(任意): デバイス側に PAIRING_CODE が設定されている
+// 場合のみ入力。HKDF salt = SHA256(code) になり、不一致だと鍵が合わず
+// ready が復号できない = E2E 確立失敗になる。
+const pairingInput = $('pairing-code');
+pairingInput.value = localStorage.getItem('pico2kvm-pairing') || '';
+pairingInput.addEventListener('change', () => {
+  localStorage.setItem('pico2kvm-pairing', pairingInput.value);
+});
+
 // --- WebSocket + E2E handshake ---
 
 async function startE2E(devEpubHex) {
@@ -190,11 +199,11 @@ async function startE2E(devEpubHex) {
   const s = await E2ESession.create();
   session = s;
   ws.send(JSON.stringify({ type: 'key', pub: s.publicKeyHex() }));
-  await s.deriveSession(devEpubHex);
+  await s.deriveSession(devEpubHex, $('pairing-code').value || undefined);
   clearTimeout(readyTimer);
   readyTimer = setTimeout(() => {
     if (!e2eReady) {
-      closeReason = 'E2E 確立失敗';
+      closeReason = 'E2E 確立失敗(ペアリングコード確認)';
       ws?.close();
     }
   }, 5000);
