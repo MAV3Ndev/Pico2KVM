@@ -11,7 +11,19 @@ set(DEVICE_TOKEN "" CACHE STRING "Device bearer token")
 set(SERVER_HOST "pico2kvm.konekosann.workers.dev" CACHE STRING "KVM server host")
 set(SERVER_PORT "443" CACHE STRING "KVM server port")
 set(DEVICE_ID "default" CACHE STRING "Device id path segment")
-set(PAIRING_CODE "" CACHE STRING "Optional pairing code mixed into the E2E HKDF salt")
+set(PAIRING_CODE "" CACHE STRING "Pairing code mixed into the E2E HKDF salt (REQUIRED: authenticates the browser side)")
+
+# The pairing code is the only thing that authenticates the browser side of
+# the E2E channel: salt = SHA256(code), so a peer that does not know the
+# code derives a different key and every frame it sends fails GCM. Without
+# it, anyone with a stolen session cookie (or a compromised relay) could
+# complete ECDH with the device and inject keystrokes. Require it.
+if (NOT PAIRING_CODE)
+  message(FATAL_ERROR
+    "PAIRING_CODE is required (-DPAIRING_CODE=...). Choose a high-entropy "
+    "code (12+ random chars); it must be entered once in the web UI and is "
+    "stored in the browser's localStorage.")
+endif()
 
 # Embed the trusted root CA as a C string literal: each PEM line becomes a
 # "line\n" \ fragment (backslash-continued) so configure_file can expand

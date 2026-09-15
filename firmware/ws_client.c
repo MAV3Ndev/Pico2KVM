@@ -21,6 +21,7 @@
 #include "lwip/dns.h"
 #include "lwip/pbuf.h"
 #include "mbedtls/ssl.h"
+#include "mbedtls/sha1.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -80,6 +81,18 @@ static struct {
   uint8_t keys[6];
 } ws_ring[WS_RING_CAP];
 static volatile uint8_t ws_ring_head, ws_ring_tail;
+
+/* Expected Sec-WebSocket-Accept value for the key we last sent
+ * (base64(SHA1(key || GUID)), 28 chars). */
+static char ws_accept[29];
+
+static const uint8_t *find_sub(const uint8_t *hay, size_t hlen,
+                               const char *needle, size_t nlen) {
+  if (nlen > hlen) return NULL;
+  for (size_t i = 0; i + nlen <= hlen; i++)
+    if (memcmp(hay + i, needle, nlen) == 0) return hay + i;
+  return NULL;
+}
 
 static uint32_t prng_state;
 static uint32_t prng_next(void) {
@@ -191,7 +204,9 @@ static void ws_to_backoff(void) {
   ws_skip_len = 0;
   if (ws_was_open || ws_backoff_ms == 0) ws_backoff_ms = WS_BACKOFF_INIT_MS;
   ws_next_try_ms = now_ms() + ws_backoff_ms;
-  if (ws_backoff_ms < WS_BACKOFF_MAX_MS) ws_backoff_ms *= 2;
+  ws_backoff_ms = ws_backoff_ms < WS_BACKOFF_MAX_MS / 2
+                      ? ws_backoff_ms * 2
+                      : WS_BACKOFF_MAX_MS;
   ws_was_open = false;
   e2e_reset(); /* new handshake required after reconnect */
   ring_push_release_all(); /* don't leave keys stuck down on the PC */
@@ -287,6 +302,13 @@ static err_t ws_send_handshake(struct altcp_pcb *pcb) {
   }
   char key[25];
   b64_encode(key_raw, 16, key);
+  /* Sec-WebSocket-Accept = base64(SHA1(key || websocket GUID)). */
+  char acc_in[24 + 36];
+  memcpy(acc_in, key, 24);
+  memcpy(acc_in + 24, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11", 36);
+  uint8_t acc_sha[20];
+  mbedtls_sha1((const uint8_t *)acc_in, sizeof acc_in, acc_sha);
+  b64_encode(acc_sha, 20, ws_accept);
   char req[512];
   int n = snprintf(req, sizeof req,
                    "GET /device/%s HTTP/1.1\r\n"
@@ -375,7 +397,7 @@ static void ws_handle_frame(const ws_frame_t *f) {
 static void ws_process_stream(void) {
   while (ws_pend_len > 0) {
     if (ws_skip_len > 0) {
-      size_t n = ws_skip_len < ws_pend_len ? ws_pend_len : (size_t)ws_skip_len;
+      size_t n = ws_skip_len < ws_pend_len ? (size_t)ws_skip_len : ws_pend_len;
       ws_pend_consume(n);
       ws_skip_len -= n;
       continue;
@@ -411,9 +433,12 @@ static void ws_handshake_input(void) {
     }
     return;
   }
-  bool ok = ws_pend_len >= 12 && memcmp(ws_pend, "HTTP/1.1 101", 12) == 0;
+  /* Verify the 101 status and the Sec-WebSocket-Accept value for the key
+   * we sent (guards against a confused/misbehaving server). */
+  bool ok = ws_pend_len >= 12 && memcmp(ws_pend, "HTTP/1.1 101", 12) == 0 &&
+            find_sub(ws_pend, end, ws_accept, sizeof ws_accept - 1) != NULL;
   if (!ok) {
-    printf("ws: upgrade rejected: %.40s\n", ws_pend);
+    printf("ws: upgrade rejected (%.12s)\n", ws_pend);
     ws_pend_len = 0;
     ws_to_backoff();
     return;
@@ -458,9 +483,10 @@ static err_t ws_on_recv(void *arg, struct altcp_pcb *pcb, struct pbuf *p, err_t 
       else
         ws_pend_len = 0;
       if (ws_state == WS_BACKOFF) {
+        u16_t tot = p->tot_len; /* read before pbuf_free */
         pbuf_free(p);
         if (ws_pcb_aborted) return ERR_ABRT; /* we aborted pcb: must not touch it */
-        altcp_recved(pcb, p->tot_len);
+        altcp_recved(pcb, tot);
         return ERR_OK;
       }
     }

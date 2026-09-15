@@ -49,6 +49,7 @@ jobs:
             -DPICO_BOARD=pico2_w \
             -DPICO_SDK_PATH="$PICO_SDK_PATH" \
             -DWIFI_SSID=ci -DWIFI_PASSWORD=ci -DDEVICE_TOKEN=ci \
+            -DPAIRING_CODE=ci-test-code \
             -DSERVER_HOST=example.workers.dev
       - name: Build
         run: cmake --build build

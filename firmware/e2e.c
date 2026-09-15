@@ -9,12 +9,10 @@
  *     browser->device {"type":"key","pub":"<130 hex>"}
  *   data (WS binary): [0x02][seq u32 LE][ciphertext][GCM tag 16]
  *   session key: HKDF-SHA256(ECDH(ephemeral).X-coord,
- *                             salt=SHA256(pairing code) or 32*0 when no
- *                             code is configured, "pico2kvm-e2e-v1")
- *   — HKDF info string kept
- *   for compatibility with already-deployed firmware; forward secrecy:
- *   the
- *   static key only signs, never encrypts.
+ *                             salt=SHA256(pairing code) — the code is
+ *                             mandatory and authenticates the browser side,
+ *                             info="pico2kvm-e2e-v1")
+ *   forward secrecy: the static key only signs, never encrypts.
  *   nonce: [dir][0 x7][seq u32 LE]; dir 0 = browser->device, 1 = reverse.
  *
  * Concurrency: see e2e.h. All functions except e2e_init() run exclusively
@@ -134,12 +132,17 @@ void e2e_init(void) {
   e2e_have_eph = false;
   e2e_hello_len = 0;
 
-  if (PICO2KVM_PAIRING_CODE[0]) {
-    mbedtls_sha256((const uint8_t *)PICO2KVM_PAIRING_CODE,
-                   sizeof(PICO2KVM_PAIRING_CODE) - 1, e2e_salt, 0);
-  } else {
-    memset(e2e_salt, 0, sizeof e2e_salt);
+  /* The pairing code is mandatory: it is what authenticates the browser
+   * side of the E2E channel (HKDF salt = SHA256(code)). Without it any
+   * peer that can reach the device socket could complete ECDH and inject
+   * keystrokes. Fail closed: no code -> e2e_ok stays false and the
+   * handshake can never complete. */
+  if (!PICO2KVM_PAIRING_CODE[0]) {
+    printf("e2e: PAIRING_CODE not configured\n");
+    return;
   }
+  mbedtls_sha256((const uint8_t *)PICO2KVM_PAIRING_CODE,
+                 sizeof(PICO2KVM_PAIRING_CODE) - 1, e2e_salt, 0);
 
   int rc = mbedtls_ctr_drbg_seed(&e2e_drbg, mbedtls_entropy_func,
                                  &e2e_entropy, NULL, 0);
@@ -276,31 +279,34 @@ static void e2e_establish(const uint8_t peer_pub[65]) {
 
 int e2e_handle_text(const uint8_t *msg, size_t len) {
   if (!e2e_ok || !msg || !len) return E2E_ACT_NONE;
-  const uint8_t *p = find_sub(msg, len, "\"pub\":\"", 7);
-  if (p) {
+  /* Dispatch on the "type" field first ("key" is a prefix of "key-req";
+   * the closing quote in the pattern keeps them distinct). */
+  if (find_sub(msg, len, "\"type\":\"key-req\"", 16)) {
+    /* The nonce is mandatory: it binds the hello signature to this
+     * handshake so a replayed hello is useless. */
+    const uint8_t *np = find_sub(msg, len, "\"nonce\":\"", 9);
+    if (!np) {
+      printf("e2e: key-req without nonce\n");
+      return E2E_ACT_NONE;
+    }
+    uint8_t nonce[16];
+    np += 9;
+    size_t rem = len - (size_t)(np - msg);
+    if (rem < 32 || !hex_decode(np, 32, nonce)) {
+      printf("e2e: bad key-req nonce\n");
+      return E2E_ACT_NONE;
+    }
+    return e2e_build_hello(nonce) == 0 ? E2E_ACT_HELLO : E2E_ACT_NONE;
+  }
+  if (find_sub(msg, len, "\"type\":\"key\"", 12)) {
+    const uint8_t *p = find_sub(msg, len, "\"pub\":\"", 7);
+    if (!p) return E2E_ACT_NONE;
     p += 7;
     if ((size_t)(len - (size_t)(p - msg)) < 130) return E2E_ACT_NONE;
     uint8_t pub[65];
     if (!hex_decode(p, 130, pub) || pub[0] != 0x04) return E2E_ACT_NONE;
     e2e_establish(pub);
     return e2e_is_ready ? E2E_ACT_READY : E2E_ACT_NONE;
-  }
-  if (find_sub(msg, len, "key-req", 7)) {
-    uint8_t nonce[16];
-    memset(nonce, 0, sizeof nonce);
-    const uint8_t *np = find_sub(msg, len, "\"nonce\":\"", 9);
-    if (np) {
-      np += 9;
-      size_t rem = len - (size_t)(np - msg);
-      if (rem < 32 || !hex_decode(np, 32, nonce)) {
-        printf("e2e: bad key-req nonce\n");
-        return E2E_ACT_NONE;
-      }
-    } else {
-      /* Legacy key-req without nonce: sign over a zero nonce. */
-      printf("e2e: key-req without nonce\n");
-    }
-    return e2e_build_hello(nonce) == 0 ? E2E_ACT_HELLO : E2E_ACT_NONE;
   }
   return E2E_ACT_NONE;
 }
@@ -315,6 +321,9 @@ void e2e_reset(void) {
   e2e_rx_seen = false;
   e2e_rx_seq_max = 0;
   e2e_hello_len = 0;
+  /* Zeroize the session key, not just the ephemeral ECDH material. */
+  mbedtls_gcm_free(&e2e_gcm);
+  mbedtls_gcm_init(&e2e_gcm);
   e2e_clear_eph(); /* destroy the ephemeral private key */
 }
 
@@ -322,6 +331,11 @@ size_t e2e_encrypt(uint8_t dir, const uint8_t *pt, size_t ptlen,
                    uint8_t *out, size_t cap) {
   if (!e2e_is_ready || ptlen + E2E_OVERHEAD > cap) return 0;
   dir &= 1;
+  if (e2e_tx_seq[dir] == UINT32_MAX) {
+    /* Nonce would wrap under this key: force a re-handshake. */
+    e2e_is_ready = false;
+    return 0;
+  }
   uint32_t seq = e2e_tx_seq[dir]++;
   uint8_t nonce[12];
   make_nonce(dir, seq, nonce);
