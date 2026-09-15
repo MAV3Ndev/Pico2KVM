@@ -1,5 +1,7 @@
 # Pico2KVM
 
+[日本語](README.ja.md)
+
 A minimal remote KVM (keyboard-only) built on a **Raspberry Pi Pico 2 W**.
 
 Type in a web page → keystrokes travel over TLS → Cloudflare Worker (Durable
@@ -24,8 +26,16 @@ ciphertext.
   `firmware/device_fingerprint.txt`; any mismatch aborts the connection.
 - **Replay protection**: per-direction monotonic sequence numbers inside every
   AEAD frame.
-- **Authenticated web UI**: password + TOTP (RFC 6238), HMAC-signed session
-  cookie, static assets served by the same Worker.
+- **Device-side TLS verification**: the firmware pins Google Trust Services
+  Root R4 (`firmware/gtsr4.pem`), the CA that issues `*.workers.dev` certs —
+  full chain + hostname verification (`VERIFY_REQUIRED`).
+- **Optional pairing code**: when `-DPAIRING_CODE=...` is set at firmware
+  configure time, it is mixed into the HKDF salt — a stolen session cookie
+  alone can no longer complete the E2E handshake.
+- **Authenticated web UI**: PBKDF2-SHA-256 password hashing (legacy rows are
+  migrated transparently), TOTP (RFC 6238), HMAC-signed session cookie,
+  login rate limiting (10 tries / 10 min), and security headers (CSP,
+  nosniff, DENY, …) on every response including assets.
 - **Key capture**: physical-position mapping (`e.code` → HID usage, incl. JIS
   keys), modifier chord tracking, Ctrl+Alt+Del/Win buttons, ASCII text paste.
 - **Self-healing firmware**: async Wi-Fi reconnect, WebSocket keepalive +
@@ -43,6 +53,7 @@ firmware/   Pico 2 W firmware (Pico SDK + TinyUSB + lwIP/altcp + mbedTLS)
   e2e.c / e2e.h       ECDH/ECDSA/HKDF/GCM handshake + frame crypto
   ws_frame.h          pure WebSocket frame parser (shared with host tests)
   gen_device_key.mjs  generates device_key.h + device_fingerprint.txt once
+  gtsr4.pem           pinned trust root for workers.dev TLS verification
   test/               host-side parser test
 worker/     Cloudflare Worker: auth API + Durable Object WS relay + assets
   src/index.ts        session/TOTP auth, /device/:id gate, DeviceSession DO
@@ -67,9 +78,9 @@ device  → encrypted {"type":"ready"}
 
 Data frames (WS binary): `[0x02][seq u32 LE][ciphertext][GCM tag 16]`
 
-- Session key: `HKDF-SHA256(ECDH.X, salt=32×0, info="pico2kvm-e2e-v1")`
-  (the `pico2kvm` info string is a protocol constant kept for compatibility
-  with already-deployed firmware)
+- Session key: `HKDF-SHA256(ECDH.X, salt=SHA256(pairing) or 32×0,
+  info="pico2kvm-e2e-v1")` (the `pico2kvm` info string is a protocol
+  constant kept for compatibility with already-deployed firmware)
 - Nonce (12 B): `[dir][0×7][seq LE]`; dir 0 = browser→device, 1 = reverse
 - Inner payload, browser→device: 8-byte HID report `[0x01][modifier][k1..k6]`
 
@@ -100,7 +111,8 @@ cmake -S firmware -B firmware/build -G Ninja \
   -DPICO_BOARD=pico2_w \
   -DWIFI_SSID=... -DWIFI_PASSWORD=... \
   -DDEVICE_TOKEN=<same as the Worker secret> \
-  -DSERVER_HOST=<your-worker>.workers.dev
+  -DSERVER_HOST=<your-worker>.workers.dev \
+  -DPAIRING_CODE=<optional>
 cmake --build firmware/build
 # hold BOOTSEL, plug in, copy build/pico2kvm.uf2 to the RP2350 drive
 ```
@@ -128,14 +140,16 @@ node scripts/e2e-it.mjs         # full relay + crypto against `wrangler dev`
 
 ## Security notes / limitations
 
-- The device↔Cloudflare hop uses TLS **without CA verification**
-  (`ALTCP_MBEDTLS_AUTHMODE = MBEDTLS_SSL_VERIFY_NONE`, see `ws_client.c`
-  `TODO: pin CA`). E2EE still protects keystroke confidentiality/integrity,
-  and the fingerprint pin prevents impersonation of the device, but a network
-  attacker could in theory intercept the transport. Pinning a CA is future
-  work.
-- TLS wraps transport; the E2E layer protects payloads end-to-end.
-- Session cookie lifetime is 8 h; no rate limiting on `/api/login` yet.
+- Device-side TLS pins **GTS Root R4** (`VERIFY_REQUIRED`). If Cloudflare
+  ever re-issues `*.workers.dev` under a different root, replace
+  `firmware/gtsr4.pem`, rebuild and reflash.
+- TLS wraps transport; the E2E layer protects payloads end-to-end even if
+  the transport were compromised.
+- Session cookie lifetime is 8 h; `/api/login` is limited to 10 attempts
+  per 10 minutes.
+- The build epoch is embedded for certificate validity checks; reflashing
+  a very old build can fail verification once the CA window no longer
+  covers it — rebuild to refresh.
 - Debug output goes to UART (GP0/GP1, 115200 baud).
 
 ## License
