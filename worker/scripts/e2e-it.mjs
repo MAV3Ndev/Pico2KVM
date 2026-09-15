@@ -3,7 +3,8 @@
 // connected through the DeviceSession Durable Object.
 // Usage: node scripts/e2e-it.mjs [baseUrl]
 //   baseUrl defaults to http://localhost:8787
-//   DEVICE_TOKEN / SESSION_SECRET are read from ../.dev.vars
+//   DEVICE_TOKEN is read from ../.dev.vars; if the dev DB is already
+//   configured, IT_PASSWORD / IT_TOTP_SECRET must match the account.
 import {
   createECDH,
   generateKeyPairSync,
@@ -30,9 +31,8 @@ const vars = Object.fromEntries(
     .map((l) => l.split('=').map((s) => s.trim())),
 );
 const DEVICE_TOKEN = vars.DEVICE_TOKEN;
-const SESSION_SECRET = vars.SESSION_SECRET;
-if (!DEVICE_TOKEN || !SESSION_SECRET) {
-  console.error('DEVICE_TOKEN / SESSION_SECRET missing from .dev.vars');
+if (!DEVICE_TOKEN) {
+  console.error('DEVICE_TOKEN missing from .dev.vars');
   process.exit(1);
 }
 
@@ -40,17 +40,71 @@ const INFO = Buffer.from('pico2kvm-e2e-v1');
 const SALT = Buffer.alloc(32);
 const td = new TextDecoder();
 
+// RFC6238 TOTP (SHA-1, 30s) — same algorithm as worker/src/index.ts.
+function b32bytes(s) {
+  const a = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = '';
+  for (const c of s.replace(/=+$/, '').toUpperCase()) {
+    const v = a.indexOf(c);
+    if (v >= 0) bits += v.toString(2).padStart(5, '0');
+  }
+  const out = Buffer.alloc(Math.floor(bits.length / 8));
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(bits.slice(i * 8, i * 8 + 8), 2);
+  return out;
+}
+function totpCode(secret) {
+  const buf = Buffer.alloc(8);
+  buf.writeUInt32BE(Math.floor(Date.now() / 30000), 4);
+  const h = createHmac('sha1', b32bytes(secret)).update(buf).digest();
+  const o = h[19] & 15;
+  const x = ((h[o] & 127) << 24) | (h[o + 1] << 16) | (h[o + 2] << 8) | h[o + 3];
+  return String(x % 1000000).padStart(6, '0');
+}
+
+async function api(path, body) {
+  const r = await fetch(`${base}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return { status: r.status, json: await r.json().catch(() => ({})), headers: r.headers };
+}
+
+// Real setup+login so the session row actually exists in D1 (sessions are
+// revocable server-side: verifySession checks the session table).
+// If the dev DB is already configured, provide IT_PASSWORD/IT_TOTP_SECRET
+// in .dev.vars matching the existing account.
+const IT_PASSWORD = vars.IT_PASSWORD || 'it-test-password';
+let itTotp = vars.IT_TOTP_SECRET;
+{
+  const s = await api('/api/setup', {
+    password: IT_PASSWORD,
+    ...(vars.SETUP_TOKEN ? { setupToken: vars.SETUP_TOKEN } : {}),
+  });
+  if (s.status === 200) {
+    itTotp = s.json.totpSecret;
+  } else if (s.status !== 409) {
+    throw new Error(`setup failed: ${s.status} ${JSON.stringify(s.json)}`);
+  }
+  if (!itTotp)
+    throw new Error(
+      'dev DB already configured: set IT_PASSWORD/IT_TOTP_SECRET in .dev.vars',
+    );
+  const login = await api('/api/login', {
+    password: IT_PASSWORD,
+    otp: totpCode(itTotp),
+  });
+  if (login.status !== 200)
+    throw new Error(`login failed: ${login.status} ${JSON.stringify(login.json)}`);
+  var sessionCookie = login.headers.get('set-cookie').split(';')[0];
+}
+
 let failures = 0;
 const ok = (cond, name) => {
   console.log(`${cond ? 'PASS' : 'FAIL'} ${name}`);
   if (!cond) failures++;
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function signSession(exp, secret) {
-  const sig = createHmac('sha256', secret).update(String(exp)).digest('hex');
-  return `${exp}.${sig}`;
-}
 
 function connect(url, headers) {
   return new Promise((resolve, reject) => {
@@ -210,8 +264,7 @@ device.onmessage = async (ev) => {
 
 // browser connects, runs the app.js handshake flow (fingerprint check is
 // out of scope here; pin verification is covered by e2e-sim)
-const cookie = `session=${signSession(Date.now() + 60000, SESSION_SECRET)}`;
-const browser = await connect(`${wsBase}/device/default`, { Cookie: cookie });
+const browser = await connect(`${wsBase}/device/default`, { Cookie: sessionCookie });
 ok(true, 'browser ws connected');
 const nonce = randomBytes(16).toString('hex');
 browser.send(JSON.stringify({ type: 'key-req', nonce }));
