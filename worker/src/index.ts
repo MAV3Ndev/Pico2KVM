@@ -123,7 +123,8 @@ const b32 = (n = 20) => {
   return s;
 };
 
-const PBKDF2_ITERS = 210000;
+// Workers WebCrypto rejects PBKDF2 iteration counts above 100000.
+const PBKDF2_ITERS = 100000;
 
 function hexToBytes(hex: string): Uint8Array {
   const out = new Uint8Array(Math.floor(hex.length / 2));
