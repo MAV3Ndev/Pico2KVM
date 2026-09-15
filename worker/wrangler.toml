@@ -1,12 +1,14 @@
 name = "pico2kvm"
 main = "src/index.ts"
 compatibility_date = "2026-09-01"
+workers_dev = true
+routes = [{ pattern = "pico.dives.tokyo", custom_domain = true }]
 [durable_objects]
 bindings = [{ name = "DEVICE", class_name = "DeviceSession" }]
 [[d1_databases]]
 binding = "DB"
 database_name = "pico2kvm"
-database_id = "b41bf237-08af-4b77-99fd-fdeb1e1c9e80"
+database_id = "88b80b8c-f7dd-481f-8fed-6eb4619d3992"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["DeviceSession"]
