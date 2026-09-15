@@ -1,0 +1,9 @@
+worker/.dev.vars
+worker/.device_token
+worker/node_modules/
+firmware/build/
+firmware/test/ws_frame_test.exe
+firmware/device_key.h
+firmware/device_fingerprint.txt
+.wrangler/
+.device_token

@@ -1,0 +1,67 @@
+body {
+  font-family: system-ui, sans-serif;
+  max-width: 34rem;
+  margin: 2rem auto;
+  padding: 0 1rem;
+  background: #f6f7f9;
+  color: #1f2937;
+}
+section {
+  background: #fff;
+  padding: 1.2rem;
+  border-radius: 8px;
+  box-shadow: 0 1px 4px #0002;
+  margin: 1rem 0;
+}
+input, button, textarea {
+  font: inherit;
+  padding: 0.6rem;
+  margin: 0.25rem 0;
+  width: 100%;
+  box-sizing: border-box;
+}
+button {
+  cursor: pointer;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #f1f5f9;
+}
+button:hover { background: #e2e8f0; }
+button:disabled { opacity: 0.5; cursor: default; }
+#status { font-weight: 600; }
+#capture {
+  border: 2px dashed #94a3b8;
+  border-radius: 8px;
+  padding: 2.5rem 1rem;
+  text-align: center;
+  color: #64748b;
+  margin: 0.5rem 0;
+  user-select: none;
+  outline: none;
+}
+#capture:focus {
+  border-color: #2563eb;
+  color: #1e293b;
+  background: #eff6ff;
+}
+#keys {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.4rem;
+  margin: 0.5rem 0;
+}
+#keys button { margin: 0; }
+#error { color: #b91c1c; }
+code { word-break: break-all; }
+#fp-confirm .note { color: #64748b; font-size: 0.9rem; }
+#fp-value { font-size: 1.1rem; letter-spacing: 0.05em; }
+/* Until E2E is established the key UI is inert. */
+#control:not(.e2e-ready) #capture,
+#control:not(.e2e-ready) #keys button,
+#control:not(.e2e-ready) #send-text {
+  opacity: 0.45;
+  pointer-events: none;
+}
+@media (max-width: 480px) {
+  #keys { grid-template-columns: 1fr 1fr; }
+}

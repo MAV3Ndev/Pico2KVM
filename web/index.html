@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Pico2KVM</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<main>
+  <h1>Pico2KVM</h1>
+
+  <section id="setup" hidden>
+    <h2>初期セットアップ</h2>
+    <form id="setup-form">
+      <input id="setup-password" type="password" placeholder="新しいパスワード" required autocomplete="new-password">
+      <button>設定する</button>
+    </form>
+    <div id="setup-result" hidden>
+      <p>認証アプリに以下を登録してください。</p>
+      <p>シークレット: <code id="totp-secret"></code></p>
+      <p>otpauth URL:<br><code id="otpauth-url"></code></p>
+      <button id="to-login">認証アプリに登録してからログインへ</button>
+    </div>
+  </section>
+
+  <section id="login" hidden>
+    <h2>ログイン</h2>
+    <form id="login-form">
+      <input id="password" type="password" placeholder="パスワード" required autocomplete="current-password">
+      <input id="otp" inputmode="numeric" pattern="[0-9]{6}" placeholder="TOTP (6桁)" required>
+      <button>ログイン</button>
+    </form>
+  </section>
+
+  <section id="control" hidden>
+    <p>デバイス: <span id="status">切断</span></p>
+    <button id="connect">接続</button>
+    <div id="capture" tabindex="0">ここをクリックしてキー入力</div>
+    <div id="keys">
+      <button data-key="enter">Enter</button>
+      <button data-key="backspace">Backspace</button>
+      <button data-key="tab">Tab</button>
+      <button data-key="escape">Esc</button>
+      <button data-key="cad">Ctrl+Alt+Del</button>
+      <button data-key="win">Win</button>
+    </div>
+    <textarea id="text" rows="3" placeholder="送信するテキスト (ASCII のみ)"></textarea>
+    <button id="send-text">テキスト送信</button>
+    <button id="logout">ログアウト</button>
+  </section>
+
+  <section id="fp-confirm" hidden>
+    <h2>デバイス確認</h2>
+    <p>デバイスのフィンガープリント:</p>
+    <p><code id="fp-value"></code></p>
+    <p class="note">firmware/device_fingerprint.txt の値と一致することを確認してください。</p>
+    <button id="fp-trust">信頼して接続</button>
+    <button id="fp-cancel">キャンセル</button>
+  </section>
+
+  <p id="error" role="alert"></p>
+</main>
+<script type="module" src="/app.js"></script>
+</body>
+</html>
