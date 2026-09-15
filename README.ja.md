@@ -74,12 +74,13 @@ device  → 暗号化 {"type":"ready"}
 
 データフレーム(WS バイナリ): `[0x02][seq u32 LE][ciphertext][GCM tag 16]`
 
-- セッション鍵: `HKDF-SHA256(ECDH.X, salt=SHA256(pairing) or 32×0,
+- セッション鍵: `HKDF-SHA256(ECDH.X, salt=SHA256(ペアリングコード),
   info="pico2kvm-e2e-v1")`
 - nonce(12B): `[dir][0×7][seq LE]`、dir 0 = browser→device、1 = 逆
 - browser→device の平文: 8バイト HID レポート `[0x01][modifier][k1..k6]`
-- 任意のペアリングコードを設定すると HKDF salt になり、セッション
-  Cookie を盗まれた場合の多層防御になります
+- ペアリングコードは**必須**で HKDF salt になり、E2E チャンネルの
+  ブラウザ側を認証します — セッション Cookie を盗まれただけでは
+  キー入力を注入できません
 
 ## デプロイ
 
@@ -92,6 +93,7 @@ wrangler d1 create pico2kvm            # database_id を wrangler.toml に設定
 wrangler d1 execute pico2kvm --remote --file schema.sql
 wrangler secret put DEVICE_TOKEN       # デバイス用のランダム bearer トークン
 wrangler secret put SESSION_SECRET     # ランダム HMAC シークレット
+wrangler secret put SETUP_TOKEN        # 任意: 初回 /api/setup をゲート
 wrangler deploy
 ```
 
@@ -109,7 +111,7 @@ cmake -S firmware -B firmware/build -G Ninja \
   -DWIFI_SSID=... -DWIFI_PASSWORD=... \
   -DDEVICE_TOKEN=<Worker と同じシークレット> \
   -DSERVER_HOST=<your-worker>.workers.dev \
-  -DPAIRING_CODE=<任意>
+  -DPAIRING_CODE=<必須: 高エントロピーのコード。Web UI で1回入力>
 cmake --build firmware/build
 # BOOTSEL を押しながら USB 接続し、build/pico2kvm.uf2 を RP2350 ドライブへ
 ```

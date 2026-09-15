@@ -33,7 +33,7 @@
 | ルート | メソッド | 認証 | 用途 |
 |---|---|---|---|
 | `GET /api/setup` | GET | なし | `{configured: bool}` |
-| `POST /api/setup` | POST | なし・初回のみ | アカウント作成、TOTP シークレット+otpauth URI を返す |
+| `POST /api/setup` | POST | 初回のみ・`SETUP_TOKEN` 設定時はそれも必要 | アカウント作成、TOTP シークレット+otpauth URI を返す。競合時は 409 |
 | `POST /api/login` | POST | パスワード+TOTP | `session` Cookie を発行 |
 | `POST /api/logout` | POST | — | Cookie 破棄 |
 | `GET /api/status` | GET | なし | `{ok, configured}` |
@@ -46,13 +46,17 @@
   (PBKDF2-SHA-256、10万回 — Workers WebCrypto の上限 — 、16B salt、
   256bit 出力)。旧形式(無 salt SHA-256)の行は一度だけ検証され、
   次回のログイン成功時に PBKDF2 形式へ自動書き換え。
-- レートリミット: 10分間のローリングウィンドウで最大10回の失敗まで
-  (`login_attempt` テーブル)。超過は 429。ログイン成功でテーブル全消去。
+- レートリミット: クライアント IP(`cf-connecting-ip`)ごとに10分間の
+  ローリングウィンドウで最大10回の失敗まで(`login_attempt`
+  テーブル)。超過は 429。ログイン成功でその IP の行を消去。
 - セッショントークン: `<exp_ms>.<HMAC-SHA256(exp)>` を `SESSION_SECRET`
   で署名。Cookie は `Secure; HttpOnly; SameSite=Strict`、有効期間 8時間。
+  トークンはログイン時に D1 の `session` テーブルにも記録され検証時に
+  照合されるため、`/api/logout`(または行の削除)で実際に失効する。
 - 101 Upgrade 以外の全レスポンスにセキュリティヘッダ:
-  `Content-Security-Policy`、`X-Content-Type-Options`、`Referrer-Policy`、
-  `X-Frame-Options`、`Permissions-Policy`。
+  `Strict-Transport-Security`、`Content-Security-Policy`、
+  `X-Content-Type-Options`、`Referrer-Policy`、`X-Frame-Options`、
+  `Permissions-Policy`。
 
 ## 3. WebSocket 区間: ブラウザ ↔ Worker ↔ デバイス
 
@@ -73,8 +77,10 @@ User-Agent: pico2kvm
   `SERVER_HOST`、チェーンは埋め込み `gtsr4.pem`(GTS Root R4 —
   `*.workers.dev` の発行元 CA)にピン留め。証明書の有効期限は
   `BUILD_EPOCH + 起動からの経過時間` で検証(ボードに RTC が無いため)。
-- HTTP 応答はステータス行(`HTTP/1.1 101`)のみ検査。`\r\n\r\n` までの
-  ヘッダは pending バッファ(最大2048B)で消費。
+- HTTP 応答はステータス行(`HTTP/1.1 101`)と `Sec-WebSocket-Accept`
+  (送信したキーから `base64(SHA1(key || "258EAFA5-E914-47DA-95CA-
+  C5AB0DC85B11"))` を計算して照合)を検査。不一致なら拒否。
+  `\r\n\r\n` までのヘッダは pending バッファ(最大2048B)で消費。
 - クライアント→サーバのフレームは RFC 6455 通りマスク付き
   (xorshift32 PRNG でマスク生成)。
 - サーバ→クライアントのフレームはファーム側でアンマスクしてから処理。
@@ -114,10 +120,16 @@ DO 経由でリレーされる。ブラウザ側の手順(`web/app.js`):
 ブラウザ: 1. fingerprint = SHA256(spub) → localStorage のピン留めと照合
           2. spub で sig を検証(静的鍵の保有証明)
           3. 初回のみ: フィンガープリントを画面表示しユーザー確認(TOFU)
-          4. ──text──► {"type":"key","pub":"<130 hex ブラウザエフェメラル>"}
+          4. セッション鍵を導出してから
+             ──text──► {"type":"key","pub":"<130 hex ブラウザエフェメラル>"}
 デバイス:  ECDH(eph_d, browser_pub) → HKDF → AES-256-GCM 鍵
            ──binary──► {"type":"ready"} の E2E フレーム
 ブラウザ:  ready を復号 → 「E2E 接続済み」(5秒でタイムアウト)
+
+DO がデバイスの(再)参加を通知({"type":"peer","device":true})し、
+key-req が処理中でなければ、ブラウザはセッション状態を捨てて新しい
+key-req を送る — デバイスは再接続のたびに E2E 状態をリセットするため、
+古いセッション鍵はもう存在しない。
 ```
 
 要点:
@@ -127,21 +139,25 @@ DO 経由でリレーされる。ブラウザ側の手順(`web/app.js`):
 - **Forward secrecy**: ECDH の共有秘密は両側エフェメラル鍵から導出。
   デバイスは `key-req` のたびにエフェメラル鍵ペアを再生成し、切断・
   再鍵交換時にゼロ化する。
-- **nonce が署名をこのハンドシェイクに紐付け**るため、hello のリプレイは
-  新しい `key-req` には使えない。
+- **nonce は必須**で、署名をこのハンドシェイクに紐付けるため、hello の
+  リプレイは新しい `key-req` には使えない。有効な16B hex の nonce を
+  持たない `key-req` は無視される。
 - **TOFU ピン留め**: `SHA256(spub)` をユーザー確認後に
   `pico2kvm-fp-default` として localStorage に保存。以後の不一致は
   ECDH 前に中断。
-- **ペアリングコード**(任意): ファームを `-DPAIRING_CODE` 付きで
-  ビルドすると `e2e_salt = SHA256(UTF8(code))`、未設定なら32Bのゼロ。
-  ブラウザは入力欄から同じ salt を導出。コードが違うと鍵も違うため
-  `ready` が復号できずハンドシェイク失敗になる。
+- **ペアリングコード**(必須): ファームは `-DPAIRING_CODE` 必須で
+  ビルドされる(未設定だと CMake が失敗し、`e2e_init` も実行時に
+  fail-closed)。`e2e_salt = SHA256(UTF8(code))`、ブラウザは入力欄から
+  同じ salt を導出。これが**ブラウザ側を認証する**仕組み: コードを
+  知らない相手は別の鍵を導出するため、送ったフレームは全て GCM 認証に
+  落ちる。これが無いと、盗まれたセッション Cookie だけでキー入力を
+  注入できてしまう。高エントロピーのコードを選ぶこと。
 
 ### セッション鍵導出
 
 ```
 shared = ECDH(エフェメラル同士) の X 座標   (32B)
-key    = HKDF-SHA256(ikm=shared, salt=上記参照, info="pico2kvm-e2e-v1", 32)
+key    = HKDF-SHA256(ikm=shared, salt=SHA256(ペアリングコード), info="pico2kvm-e2e-v1", 32)
 cipher = AES-256-GCM
 ```
 
@@ -159,7 +175,8 @@ WS **バイナリ**フレーム。ワイヤー形式:
 - **nonce(12B)**: `[dir][ゼロ7B][seq u32 LE]`。
   `dir` 0 = ブラウザ→デバイス、1 = デバイス→ブラウザ。方向分離により
   両側で nonce が衝突しない。
-- **リプレイ拒否**: `seq <= 受信済み最大値` は復号前にドロップ。
+- **リプレイ拒否**: `seq <= 認証済みの最大値` は復号前にドロップ
+  (ウィンドウは有効な GCM タグの時だけ進む)。
   (厳密な単調増加。並び替え窓は無い — TCP が順序を保証するため)
 - **ダウングレード防止**: デバイスは `0x02` で始まりちょうど
   `21+8` バイトのバイナリフレームしか受け付けない。仮に平文の `0x01`
@@ -188,7 +205,7 @@ WS_IDLE ──リンク確立──► WS_DNS ──► WS_CONNECTING ──► 
 
 | 定数 | 値 | 意味 |
 |---|---|---|
-| `WS_PING_MS` | 20 000 | アイドル時のクライアント ping |
+| `WS_PING_MS` | 20 000 | オープン中は20秒ごとにクライアント ping |
 | `WS_RX_TIMEOUT_MS` | 60 000 | 受信が無いと再接続 |
 | `WS_HS_TIMEOUT_MS` | 15 000 | アップグレードの完了期限 |
 | `WS_BACKOFF_INIT_MS` | 2 000 | 初回リトライ待ち |

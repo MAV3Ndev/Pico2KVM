@@ -29,9 +29,11 @@ ciphertext.
 - **Device-side TLS verification**: the firmware pins Google Trust Services
   Root R4 (`firmware/gtsr4.pem`), the CA that issues `*.workers.dev` certs —
   full chain + hostname verification (`VERIFY_REQUIRED`).
-- **Optional pairing code**: when `-DPAIRING_CODE=...` is set at firmware
-  configure time, it is mixed into the HKDF salt — a stolen session cookie
-  alone can no longer complete the E2E handshake.
+- **Mandatory pairing code**: `-DPAIRING_CODE=...` is required at firmware
+  configure time and becomes the HKDF salt — it is what authenticates the
+  *browser* side of the E2E channel, so a stolen session cookie (or a
+  compromised relay) cannot inject keystrokes. Choose a high-entropy code;
+  it is entered once in the web UI and stored in localStorage.
 - **Authenticated web UI**: PBKDF2-SHA-256 password hashing (legacy rows are
   migrated transparently), TOTP (RFC 6238), HMAC-signed session cookie,
   login rate limiting (10 tries / 10 min), and security headers (CSP,
@@ -80,7 +82,7 @@ device  → encrypted {"type":"ready"}
 
 Data frames (WS binary): `[0x02][seq u32 LE][ciphertext][GCM tag 16]`
 
-- Session key: `HKDF-SHA256(ECDH.X, salt=SHA256(pairing) or 32×0,
+- Session key: `HKDF-SHA256(ECDH.X, salt=SHA256(pairing code),
   info="pico2kvm-e2e-v1")`
 - Nonce (12 B): `[dir][0×7][seq LE]`; dir 0 = browser→device, 1 = reverse
 - Inner payload, browser→device: 8-byte HID report `[0x01][modifier][k1..k6]`
@@ -96,6 +98,7 @@ wrangler d1 create pico2kvm            # then set database_id in wrangler.toml
 wrangler d1 execute pico2kvm --remote --file schema.sql
 wrangler secret put DEVICE_TOKEN       # random bearer token for the device
 wrangler secret put SESSION_SECRET     # random HMAC secret
+wrangler secret put SETUP_TOKEN        # optional: gates first-run /api/setup
 wrangler deploy
 ```
 
@@ -113,7 +116,7 @@ cmake -S firmware -B firmware/build -G Ninja \
   -DWIFI_SSID=... -DWIFI_PASSWORD=... \
   -DDEVICE_TOKEN=<same as the Worker secret> \
   -DSERVER_HOST=<your-worker>.workers.dev \
-  -DPAIRING_CODE=<optional>
+  -DPAIRING_CODE=<required: high-entropy code, entered once in the web UI>
 cmake --build firmware/build
 # hold BOOTSEL, plug in, copy build/pico2kvm.uf2 to the RP2350 drive
 ```

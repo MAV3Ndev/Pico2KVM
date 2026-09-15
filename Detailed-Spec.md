@@ -32,7 +32,7 @@ framing, the E2E handshake, retry behaviour, and every timer/constant.
 | Route | Method | Auth | Purpose |
 |---|---|---|---|
 | `GET /api/setup` | GET | none | `{configured: bool}` |
-| `POST /api/setup` | POST | none, first-run only | creates account row; returns TOTP secret + otpauth URI |
+| `POST /api/setup` | POST | first-run only; `SETUP_TOKEN` secret if configured | creates account row; returns TOTP secret + otpauth URI; 409 on race |
 | `POST /api/login` | POST | password + TOTP | sets `session` cookie |
 | `POST /api/logout` | POST | — | clears cookie |
 | `GET /api/status` | GET | none | `{ok, configured}` |
@@ -45,15 +45,19 @@ framing, the E2E handshake, retry behaviour, and every timer/constant.
   (PBKDF2-SHA-256, 100 000 iterations — the Workers WebCrypto maximum —
   16-byte salt, 256-bit output). Legacy bare-SHA-256 rows are verified once
   and transparently re-written in PBKDF2 form on the next successful login.
-- Rate limit: at most 10 failed attempts per rolling 10-minute window
-  (`login_attempt` table); further attempts return 429. A successful login
-  clears the table.
+- Rate limit: at most 10 failed attempts per client IP
+  (`cf-connecting-ip`) per rolling 10-minute window (`login_attempt`
+  table); further attempts return 429. A successful login clears that
+  IP's rows.
 - Session token: `<exp_ms>.<HMAC-SHA256(exp)>` signed with
   `SESSION_SECRET`, cookie flags `Secure; HttpOnly; SameSite=Strict`,
-  8 h lifetime.
+  8 h lifetime. Tokens are also recorded in the D1 `session` table at
+  login and verified against it, so `/api/logout` (or deleting the row)
+  actually revokes the session.
 - Security headers on every response except 101 upgrades:
-  `Content-Security-Policy`, `X-Content-Type-Options`, `Referrer-Policy`,
-  `X-Frame-Options`, `Permissions-Policy`.
+  `Strict-Transport-Security`, `Content-Security-Policy`,
+  `X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`,
+  `Permissions-Policy`.
 
 ## 3. WebSocket hop: browser ↔ Worker ↔ device
 
@@ -74,8 +78,11 @@ User-Agent: pico2kvm
   chain pinned to embedded `gtsr4.pem` (GTS Root R4 — the CA that issues
   `*.workers.dev`). Cert validity is checked against
   `BUILD_EPOCH + uptime` (the board has no RTC).
-- Only the status line is checked (`HTTP/1.1 101`); headers after it are
-  consumed up to `\r\n\r\n` (max 2048 bytes pending buffer).
+- The response is validated on the status line (`HTTP/1.1 101`) **and**
+  the `Sec-WebSocket-Accept` value must match
+  `base64(SHA1(sent key || "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))`;
+  anything else is rejected. Headers are consumed up to `\r\n\r\n`
+  (max 2048 bytes pending buffer).
 - Client→server frames are masked per RFC 6455 (xorshift32 PRNG mask).
 - Server→client frames are unmasked by the firmware before dispatch.
 
@@ -116,10 +123,16 @@ device  ──text────►  {"type":"hello","fw":"pico2kvm",
 browser: 1. fingerprint = SHA256(spub) → compare with pinned localStorage
          2. verify sig with spub  (proves possession of static key)
          3. first connect: show fingerprint, wait for user confirm (TOFU)
-         4. ──text──► {"type":"key","pub":"<130 hex browser ephemeral>"}
+         4. derive session key, then
+            ──text──► {"type":"key","pub":"<130 hex browser ephemeral>"}
 device:   ECDH(eph_d, browser_pub) → HKDF → AES-256-GCM key
           ──binary──► E2E frame of {"type":"ready"}
 browser:  decrypts ready → "E2E 接続済み" (5 s timeout otherwise)
+
+Whenever the DO reports the device (re)joining ({"type":"peer",
+"device":true}) and no key-req is in flight, the browser drops its session
+state and sends a fresh key-req — the device resets its E2E state on every
+reconnect, so the old session key is gone.
 ```
 
 Key points:
@@ -129,21 +142,25 @@ Key points:
 - **Forward secrecy**: the ECDH shared secret uses ephemeral keys on both
   sides. The device regenerates its ephemeral pair on every `key-req` and
   zeroises it on disconnect/re-key.
-- **The nonce binds the signature to this handshake**, so a replayed hello
-  cannot satisfy a fresh `key-req`.
+- **The nonce is mandatory and binds the signature to this handshake**, so
+  a replayed hello cannot satisfy a fresh `key-req`. A `key-req` without a
+  valid 16-byte hex nonce is ignored.
+- **Pairing code (required)**: the firmware must be built with
+  `-DPAIRING_CODE` (CMake fails without it, and `e2e_init` fails closed at
+  runtime). `e2e_salt = SHA256(UTF8(code))`; the browser derives the same
+  salt from the input field. This is what authenticates the *browser* side:
+  a peer that does not know the code derives a different key, so every
+  frame it sends fails GCM authentication. Without it a stolen session
+  cookie would suffice to inject keystrokes. Choose a high-entropy code.
 - **TOFU pin**: `SHA256(spub)` is stored under `pico2kvm-fp-default` in
   localStorage after explicit user confirmation; any later mismatch aborts
   before ECDH.
-- **Pairing code** (optional): if the firmware was built with
-  `-DPAIRING_CODE`, `e2e_salt = SHA256(UTF8(code))`; otherwise 32 zero
-  bytes. The browser derives the same salt from the input field. A wrong
-  code produces a wrong key → `ready` never decrypts → handshake fails.
 
 ### Session key derivation
 
 ```
 shared = ECDH(ephemeral pairs) .X coordinate   (32 bytes)
-key    = HKDF-SHA256(ikm=shared, salt=see above, info="pico2kvm-e2e-v1", 32)
+key    = HKDF-SHA256(ikm=shared, salt=SHA256(pairing code), info="pico2kvm-e2e-v1", 32)
 cipher = AES-256-GCM
 ```
 
@@ -161,7 +178,8 @@ WS **binary** frames. Wire format:
 - **Nonce (12 B)**: `[dir][7 zero bytes][seq u32 LE]`;
   `dir` 0 = browser→device, 1 = device→browser. Direction separation means
   the two sides can never reuse a nonce.
-- **Replay rejection**: `seq <= last seen` is dropped before decryption.
+- **Replay rejection**: `seq <= last *authenticated* seq` is dropped before
+  decryption (the window only advances on a valid GCM tag).
   (Strictly increasing; there is no reordering window — TCP guarantees
   order anyway.)
 - **Downgrade prevention**: the device only accepts binary frames starting
@@ -191,7 +209,7 @@ Timers:
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `WS_PING_MS` | 20 000 | client pings when idle |
+| `WS_PING_MS` | 20 000 | client pings every 20 s while open |
 | `WS_RX_TIMEOUT_MS` | 60 000 | no inbound byte ⇒ reconnect |
 | `WS_HS_TIMEOUT_MS` | 15 000 | upgrade must finish |
 | `WS_BACKOFF_INIT_MS` | 2 000 | first retry delay |
