@@ -6,6 +6,86 @@ This document describes exactly how bytes flow between the browser, the
 Cloudflare Worker, and the RP2350 device — including authentication,
 framing, the E2E handshake, retry behaviour, and every timer/constant.
 
+We start with a glossary and an end-to-end walkthrough, then go into the
+per-layer details.
+
+## Glossary
+
+| Term | Meaning |
+|---|---|
+| USB HID | The standard that lets a device present itself as a keyboard/mouse. Works with built-in OS drivers — nothing to install on the target PC |
+| HID report | The 8-byte payload describing which keys are held (modifiers + up to 6 keys). The PC treats it as real keyboard input |
+| WebSocket / WSS | A persistent bidirectional connection that starts as HTTP. WSS = WebSocket over TLS |
+| TLS | Encrypts the transport itself (the "S" in HTTPS) and authenticates the server via its certificate |
+| CA pinning | Hardcoding which certificate authority (CA) must have issued the server cert; wrong/forged certs get rejected |
+| Durable Object (DO) | Cloudflare's "stateful Worker": exactly one instance per ID. Used here as the relay between the two sockets |
+| NAT | Lets devices inside a network reach out, but blocks unsolicited inbound connections — the reason the device dials out |
+| E2E encryption | Only the two endpoints (browser and device) can read the payload. The Worker relay sees ciphertext only |
+| Static / ephemeral key | Static = long-term "identity card" key. Ephemeral = generated per connection and thrown away |
+| ECDH | Both sides exchange only public keys and independently derive the same shared secret |
+| ECDSA | Sign with a private key, verify with the public key — used to prove possession of the static key |
+| HKDF | Turns a shared secret into a proper cipher key; salt/info separate different key uses |
+| AES-256-GCM | Encryption with built-in tamper detection. Reusing a nonce breaks it, so nonces are derived from a counter |
+| nonce | A "number used once". Here, a random value that prevents handshake replay |
+| seq (sequence number) | Per-message counter; lets the receiver detect replayed frames |
+| Fingerprint | A hash of a public key, short enough for humans to compare visually |
+| TOFU | Trust On First Use: trust the fingerprint seen the first time, warn if it ever changes (same idea as SSH) |
+| Forward secrecy | Even if a private key leaks later, past sessions cannot be decrypted |
+| PBKDF2 | Deliberately slow password hashing (many iterations) to make brute force expensive |
+| TOTP | The 6-digit code from an authenticator app that changes every 30 s; the second login factor |
+| MITM | Man-in-the-middle attack: intercepting or modifying traffic between the endpoints |
+
+## Communication flow (step by step)
+
+The full path of a single keystroke, from power-on to the target PC.
+
+### A. Device boot → online
+
+1. Pico 2 W powers up → connects to Wi-Fi (retries every 10 s on
+   failure). LED: off → blinking
+2. Resolves `SERVER_HOST` via DNS → TCP 443 → TLS handshake. The
+   certificate is checked against the embedded GTS Root R4; abort on
+   mismatch
+3. Sends a WS upgrade request `GET /device/default` with
+   `Authorization: Bearer <DEVICE_TOKEN>`
+4. The Worker checks the token → hands the socket to the Durable Object →
+   registered as the "device" role. LED solid = online
+
+### B. Browser login → E2E established
+
+5. Open the URL, log in with password + TOTP → receive the `session`
+   cookie
+6. Press "connect" → browser opens `wss://…/device/default` → the DO
+   registers it as the "browser" role and reports device presence via a
+   `peer` message
+7. Browser sends `key-req` with a 16-byte random nonce
+8. Device generates a throwaway ephemeral key pair and replies `hello`
+   with static pubkey + ephemeral pubkey + signature
+9. Browser checks the static-key fingerprint against the pinned value
+   (visual confirm on first connect) + verifies the signature → sends its
+   own ephemeral pubkey as `key`
+10. Both sides run ECDH → HKDF (pairing code as salt) → arrive at the
+    same AES-256-GCM key
+11. Device sends an encrypted `ready` → if the browser can decrypt it,
+    "E2E connected". Failure = wrong pairing code or an impostor
+
+### C. Keystroke (repeats)
+
+12. User presses a key → browser maps `KeyboardEvent.code` to a HID usage
+    and builds the 8-byte report
+13. Encrypts with AES-256-GCM + seq → WS binary frame → Worker/DO
+    forwards it **without seeing the contents**
+14. Device checks seq (drops stale numbers) → decrypts →
+    `tud_hid_keyboard_report()` → the target PC receives ordinary USB
+    keyboard input
+
+### D. Disconnect / reconnect
+
+15. If the WS drops, the device queues an all-keys-up report (prevents
+    stuck keys), wipes all E2E state, and returns to step 2 after backoff
+16. When the DO tells the browser the device rejoined, the browser drops
+    the old session and restarts the handshake from step 7
+
 ## 1. Topology
 
 ```
